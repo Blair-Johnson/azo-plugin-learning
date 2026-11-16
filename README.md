@@ -80,6 +80,12 @@ installer copies `config/learning.yaml` there if it is missing and preserves it
 afterwards. Edits apply on the next tool call. Invalid values keep their
 defaults and are reported in the next study step.
 
+The same settings appear in the TUI under `/config` → Plugins → Learning.
+Changes there are validated and written to that file, keeping its comments.
+Decimal settings are edited as text, because plugin settings have no decimal
+type. If the file isn't simple block-style YAML that can be edited safely, the
+change is refused and the file is left untouched.
+
 ## Storage
 
 Everything lives in `<state-home>/learning/learning.sqlite`, where

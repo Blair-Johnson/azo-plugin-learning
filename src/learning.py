@@ -22,6 +22,7 @@ by every project and session. Thresholds come from the plugin's YAML config.
 
 from __future__ import annotations
 
+import math
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ from agent_utils.tool import Tool
 from agent_utils.types import MODEL_RENDER_CHANNEL
 from agent_zoo.projects import resolve_state_root
 from agent_zoo.runtime.commands import Arg, Command, CommandResult
+from agent_zoo.runtime.settings import Setting, SettingError
 
 _PLUGIN_NAME = "azo-plugin-learning"
 STUDY_FLAG = "learning_study_active"
@@ -51,55 +53,125 @@ QUESTION_PHASES = ("review", "probe", "teach", "orient")
 # Config
 # ---------------------------------------------------------------------------
 
-DEFAULT_CONFIG: dict[str, dict[str, float | int]] = {
-    "cycle": {
-        # Review questions at the start of each cycle, when nodes are due.
-        "review_questions": 2,
-        # Probe questions before teaching, if the user doesn't miss first.
-        "probe_questions": 3,
-        # Times a node is taught before moving on and leaving it to review.
-        "max_teach_attempts": 2,
-        # How far from the last answered node to look for probe candidates,
-        # in dependency links.
-        "focus_hops": 2,
-        # Candidate nodes and observations shown to the agent per step.
-        "candidates": 6,
-    },
-    "accuracy": {
-        # Recent answers used to judge whether questions are too hard or easy.
-        "window_answers": 10,
-        "window_hours": 12,
-        "min_answers": 4,
-        # Below low: one probe per cycle and easier targets. Above high: harder.
-        "low": 0.75,
-        "high": 0.90,
-    },
-    "review": {
-        # Review interval after a lapse or a first success.
-        "base_interval_days": 1.0,
-        # Each further spaced success multiplies the interval by this.
-        "growth_factor": 3.0,
-        # Successes closer together than this count as one.
-        "min_success_gap_hours": 8.0,
-        # A node is due once time since its last evidence reaches this
-        # multiple of its interval.
-        "due_ratio": 1.0,
-        # Extra review priority per node that depends on this one.
-        "dependent_weight": 0.25,
-    },
-    "scoring": {
-        # Evidence weight halves over this many days, for hole/edge scores.
-        "half_life_days": 30.0,
-        # Weight of a passive observation relative to a study answer.
-        "observation_weight": 0.4,
-        # How much neighbours' evidence counts toward a node's scores.
-        "neighbour_weight": 0.5,
-    },
-}
+@dataclass(frozen=True)
+class ConfigOption:
+    section: str
+    key: str
+    default: int | float
+    label: str
+    help: str
+    minimum: int | float = 0
+    maximum: int | float | None = None
+
+
+# Every threshold the plugin reads. Integer defaults make integer options.
+CONFIG_OPTIONS = (
+    ConfigOption(
+        "cycle", "review_questions", 2, "Review questions per cycle",
+        "Questions on nodes due for review at the start of each cycle, when any are due.",
+    ),
+    ConfigOption(
+        "cycle", "probe_questions", 3, "Probe questions per cycle",
+        "Probe questions before teaching, unless the user misses one first.", minimum=1,
+    ),
+    ConfigOption(
+        "cycle", "max_teach_attempts", 2, "Teaching attempts",
+        "Times a missed node is taught before it is left for review.", minimum=1,
+    ),
+    ConfigOption(
+        "cycle", "focus_hops", 2, "Focus distance",
+        "How many dependency links from the last answered node to look for probe candidates.",
+    ),
+    ConfigOption(
+        "cycle", "candidates", 6, "Candidates per step",
+        "Candidate nodes and observations shown to the agent in each step.", minimum=1,
+    ),
+    ConfigOption(
+        "accuracy", "window_answers", 10, "Answers considered",
+        "Most recent graded answers used to judge whether questions are too hard or easy.",
+        minimum=1,
+    ),
+    ConfigOption(
+        "accuracy", "window_hours", 12, "Accuracy window (hours)",
+        "Only answers from this many recent hours count toward accuracy.",
+    ),
+    ConfigOption(
+        "accuracy", "min_answers", 4, "Minimum answers",
+        "Answers needed in the window before difficulty adjusts.",
+    ),
+    ConfigOption(
+        "accuracy", "low", 0.75, "Low accuracy threshold",
+        "Below this fraction correct, cycles probe once and the agent asks easier questions.",
+        maximum=1,
+    ),
+    ConfigOption(
+        "accuracy", "high", 0.90, "High accuracy threshold",
+        "Above this fraction correct, the agent asks harder questions.", maximum=1,
+    ),
+    ConfigOption(
+        "review", "base_interval_days", 1.0, "Base interval (days)",
+        "Review interval after a miss or a first success.",
+    ),
+    ConfigOption(
+        "review", "growth_factor", 3.0, "Interval growth",
+        "Each further spaced success multiplies the review interval by this.",
+    ),
+    ConfigOption(
+        "review", "min_success_gap_hours", 8.0, "Minimum spacing (hours)",
+        "Successes closer together than this count as one.",
+    ),
+    ConfigOption(
+        "review", "due_ratio", 1.0, "Due ratio",
+        "A node is due once the time since its last evidence reaches this multiple of its"
+        " interval. Due nodes are ranked, never queued.",
+    ),
+    ConfigOption(
+        "review", "dependent_weight", 0.25, "Dependent bonus",
+        "Extra review priority for each node that depends on this one.",
+    ),
+    ConfigOption(
+        "scoring", "half_life_days", 30.0, "Evidence half-life (days)",
+        "Evidence weight halves over this many days when scoring holes and edges.",
+    ),
+    ConfigOption(
+        "scoring", "observation_weight", 0.4, "Observation weight",
+        "Weight of a passive observation from a working session, relative to a study answer.",
+    ),
+    ConfigOption(
+        "scoring", "neighbour_weight", 0.5, "Neighbour weight",
+        "How much neighbouring nodes' evidence counts toward hole and edge scores.",
+    ),
+)
+
+_OPTIONS = {(option.section, option.key): option for option in CONFIG_OPTIONS}
+
+DEFAULT_CONFIG: dict[str, dict[str, float | int]] = {}
+for _option in CONFIG_OPTIONS:
+    DEFAULT_CONFIG.setdefault(_option.section, {})[_option.key] = _option.default
 
 
 def config_path() -> Path:
     return resolve_state_root() / "plugin-configs" / _PLUGIN_NAME / "config" / "learning.yaml"
+
+
+def coerce_option(option: ConfigOption, value: Any) -> int | float:
+    """Return ``value`` as the option's type, or raise ValueError."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("must be a number")
+    if not math.isfinite(value):
+        raise ValueError("must be finite")
+    if isinstance(option.default, int):
+        if value != int(value):
+            raise ValueError("must be a whole number")
+        value = int(value)
+    else:
+        value = float(value)
+    if value < option.minimum:
+        raise ValueError(f"must be at least {option.minimum:g}")
+    if option.maximum is not None and value > option.maximum:
+        raise ValueError(f"must be at most {option.maximum:g}")
+    return value
 
 
 def load_config() -> dict[str, Any]:
@@ -123,20 +195,102 @@ def load_config() -> dict[str, Any]:
     if not isinstance(raw, dict):
         warnings.append(f"{path} is not a mapping")
         return cfg
-    for section, defaults in DEFAULT_CONFIG.items():
+    for section in DEFAULT_CONFIG:
         values = raw.get(section) or {}
         if not isinstance(values, dict):
             warnings.append(f"{section} is not a mapping")
             continue
         for key, value in values.items():
-            if key not in defaults:
+            option = _OPTIONS.get((section, key))
+            if option is None:
                 warnings.append(f"unknown setting {section}.{key}")
                 continue
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-                warnings.append(f"{section}.{key} must be a non-negative number")
-                continue
-            cfg[section][key] = type(defaults[key])(value)
+            try:
+                cfg[section][key] = coerce_option(option, value)
+            except ValueError as exc:
+                warnings.append(f"{section}.{key} {exc}")
     return cfg
+
+
+def _set_yaml_value(text: str, section: str, key: str, scalar: str) -> str:
+    """Set ``section.key`` in a simple block-style YAML file, keeping comments."""
+
+    lines = text.splitlines()
+    header = re.compile(rf"^{re.escape(section)}\s*:\s*(#.*)?$")
+    start = next((i for i, line in enumerate(lines) if header.match(line)), None)
+    if start is None:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines += [f"{section}:", f"  {key}: {scalar}"]
+        return "\n".join(lines) + "\n"
+
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end][0] in " \t#"):
+        end += 1
+    entry = re.compile(rf"^(\s+){re.escape(key)}\s*:(.*)$")
+    for i in range(start + 1, end):
+        match = entry.match(lines[i])
+        if match:
+            comment = match.group(2).find(" #")
+            suffix = match.group(2)[comment:] if comment >= 0 else ""
+            lines[i] = f"{match.group(1)}{key}: {scalar}{suffix}"
+            return "\n".join(lines) + "\n"
+    insert = end
+    while insert > start + 1 and not lines[insert - 1].strip():
+        insert -= 1
+    lines.insert(insert, f"  {key}: {scalar}")
+    return "\n".join(lines) + "\n"
+
+
+def _replace_file(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(text)
+    temporary.replace(path)
+
+
+def write_config_value(option: ConfigOption, value: int | float) -> None:
+    """Save one option to the config file, leaving everything else unchanged.
+
+    The edit is checked by rereading the whole config. If any other value or
+    warning changed, the original file is restored and SettingError is raised.
+    """
+
+    path = config_path()
+    try:
+        original = path.read_text() if path.exists() else None
+    except OSError:
+        raise SettingError(f"Cannot read {path}") from None
+    try:
+        parsed = yaml.safe_load(original or "") or {}
+    except yaml.YAMLError:
+        parsed = None
+    if not isinstance(parsed, dict):
+        raise SettingError(f"{path} is not a valid YAML mapping; fix it before editing here")
+
+    before = load_config()
+    updated = _set_yaml_value(original or "", option.section, option.key, repr(value))
+    try:
+        _replace_file(path, updated)
+        after = load_config()
+        expected = {name: dict(values) for name, values in before.items() if name != "_warnings"}
+        expected[option.section][option.key] = value
+        if {name: values for name, values in after.items() if name != "_warnings"} != expected:
+            raise ValueError("the saved file did not read back as expected")
+        own = f"{option.section}.{option.key} "
+        if [w for w in after["_warnings"] if not w.startswith(own)] != [
+            w for w in before["_warnings"] if not w.startswith(own)
+        ]:
+            raise ValueError("the saved file produced new warnings")
+    except (OSError, ValueError):
+        try:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                _replace_file(path, original)
+        except OSError:
+            pass
+        raise SettingError(f"Could not save {option.label} to {path}") from None
 
 
 # ---------------------------------------------------------------------------
@@ -1372,6 +1526,51 @@ def _study_off(ctx):
     return CommandResult.notice("Study session off.")
 
 
+# ---------------------------------------------------------------------------
+# /config settings
+# ---------------------------------------------------------------------------
+
+_SETTING_GROUPS = {
+    "cycle": "Learning / Study cycle",
+    "accuracy": "Learning / Difficulty",
+    "review": "Learning / Review timing",
+    "scoring": "Learning / Scoring",
+}
+
+
+def _make_setting(option: ConfigOption) -> Setting:
+    # The settings API has no float kind, so decimal options are edited as text.
+    integer = isinstance(option.default, int)
+
+    def get(ctx):
+        value = load_config()[option.section][option.key]
+        return value if integer else format(value, "g")
+
+    def set_(ctx, value):
+        if not integer:
+            try:
+                value = float(str(value).strip())
+            except ValueError:
+                raise SettingError(f"{option.label} must be a number") from None
+        try:
+            value = coerce_option(option, value)
+        except ValueError as exc:
+            raise SettingError(f"{option.label} {exc}") from None
+        write_config_value(option, value)
+
+    return Setting(
+        key=f"learning.{option.section}.{option.key}",
+        label=option.label,
+        kind="int" if integer else "text",
+        get=get,
+        set=set_,
+        group=_SETTING_GROUPS[option.section],
+        help=f"{option.help} Default: {option.default:g}.",
+        min=option.minimum if integer else None,
+        max=option.maximum if integer else None,
+    )
+
+
 def register_features(builder, *, session, config):
     builder.add(Feature(
         name="learning_observations",
@@ -1397,4 +1596,9 @@ def register_features(builder, *, session, config):
             ),
         ],
         order=[Command],
+    ))
+    builder.add(Feature(
+        name="learning_settings",
+        components=[_make_setting(option) for option in CONFIG_OPTIONS],
+        order=[Setting],
     ))

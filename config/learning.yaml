@@ -1,5 +1,6 @@
-# azo-plugin-learning settings. Edits apply on the next tool call; no reload
-# is needed. Omitted settings use the defaults shown here.
+# azo-plugin-learning settings. Edit them here or under /config -> Plugins ->
+# Learning. Edits apply on the next tool call; no reload is needed. Omitted
+# settings use the defaults shown here.
 
 cycle:
   # Review questions at the start of each cycle, when nodes are due.

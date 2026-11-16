@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -300,6 +301,115 @@ def test_connect_migrates_evidence_table_without_question_phase():
 
     assert row["evidence"] == "kept"
     assert row["question_phase"] is None
+
+
+def _settings():
+    from agent_zoo.runtime.settings import Setting, SettingsContext, SettingsRegistry
+
+    session = _build_session()
+    registry = SettingsRegistry([c for c in session.pipeline if isinstance(c, Setting)])
+    assert registry.error is None
+    ctx = SettingsContext(session)
+
+    def catalog():
+        return {row["key"]: row for row in registry.catalog(ctx)}
+
+    def set_(key, value):
+        return registry.handle(
+            {"type": "plugin_settings", "request_id": "r1", "action": "set",
+             "binding": registry.binding, "key": key, "value": value},
+            ctx,
+        )
+
+    return catalog, set_
+
+
+def test_settings_expose_every_config_option_with_defaults():
+    catalog, _ = _settings()
+    rows = catalog()
+
+    assert len(rows) == len(plugin.CONFIG_OPTIONS)
+    probe = rows["learning.cycle.probe_questions"]
+    assert (probe["kind"], probe["value"], probe["min"], probe["group"]) == (
+        "int", 3, 1, "Learning / Study cycle"
+    )
+    low = rows["learning.accuracy.low"]
+    assert (low["kind"], low["value"], low["apply"]) == ("text", "0.75", "live")
+    assert all(row["error"] is None and row["writable"] for row in rows.values())
+
+
+def test_settings_write_the_config_file_and_keep_its_comments(tmp_path):
+    shipped = (Path(__file__).parent.parent / "config" / "learning.yaml").read_text()
+    _write_config(tmp_path, shipped)
+    catalog, set_ = _settings()
+
+    assert set_("learning.cycle.probe_questions", 5)["ok"]
+    assert set_("learning.accuracy.low", " 0.6 ")["ok"]
+
+    text = plugin.config_path().read_text()
+    assert "  probe_questions: 5\n" in text and "  low: 0.6\n" in text
+    assert text.count("#") == shipped.count("#")
+    cfg = plugin.load_config()
+    assert cfg["cycle"]["probe_questions"] == 5 and cfg["accuracy"]["low"] == 0.6
+    assert cfg["_warnings"] == []
+    assert catalog()["learning.accuracy.low"]["value"] == "0.6"
+
+
+def test_settings_create_the_config_file_when_missing():
+    _, set_ = _settings()
+
+    assert set_("learning.scoring.half_life_days", "14")["ok"]
+
+    assert plugin.load_config()["scoring"]["half_life_days"] == 14.0
+    assert plugin.config_path().read_text() == "scoring:\n  half_life_days: 14.0\n"
+
+
+@pytest.mark.parametrize(
+    "key, value, message",
+    [
+        ("learning.accuracy.high", "lots", "must be a number"),
+        ("learning.accuracy.high", "1.5", "at most 1"),
+        ("learning.review.growth_factor", "-2", "at least 0"),
+        ("learning.review.growth_factor", "nan", "finite"),
+    ],
+)
+def test_settings_reject_invalid_values_without_writing(key, value, message):
+    _, set_ = _settings()
+
+    result = set_(key, value)
+
+    assert not result["ok"] and message in result["error"]["message"]
+    assert not plugin.config_path().exists()
+
+
+def test_settings_refuse_to_edit_an_unparseable_file(tmp_path):
+    _write_config(tmp_path, "cycle: [unclosed\n")
+    _, set_ = _settings()
+
+    result = set_("learning.cycle.candidates", 3)
+
+    assert not result["ok"] and "not a valid YAML mapping" in result["error"]["message"]
+    assert plugin.config_path().read_text() == "cycle: [unclosed\n"
+
+
+def test_settings_restore_a_file_they_cannot_edit_safely(tmp_path):
+    original = "cycle: {probe_questions: 4, candidates: 2}\n"
+    _write_config(tmp_path, original)
+    _, set_ = _settings()
+
+    result = set_("learning.cycle.review_questions", 1)
+
+    assert not result["ok"] and "Could not save" in result["error"]["message"]
+    assert plugin.config_path().read_text() == original
+
+
+def test_setting_a_value_clears_its_own_warning(tmp_path):
+    _write_config(tmp_path, "cycle:\n  candidates: -3\n")
+    _, set_ = _settings()
+
+    assert set_("learning.cycle.candidates", 4)["ok"]
+    cfg = plugin.load_config()
+    assert cfg["cycle"]["candidates"] == 4 and cfg["_warnings"] == []
 
 
 # --- passive observations ----------------------------------------------------

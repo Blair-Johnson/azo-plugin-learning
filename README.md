@@ -7,43 +7,52 @@ understands, while they work and while they study between agent turns.
 
 In normal sessions, agents see one tool:
 `characterize_user_understanding(topic, evidence, understands)`. They call it
-whenever the user reveals that they do or don't understand something, even when
-it is unrelated to the current task. Each call appends an observation to a
-global queue, together with the project, session id, and index of the user's
-latest message, so a study session can revisit the transcript.
+whenever the user reveals that they do or don't understand something about the
+wider world, such as how a technology, algorithm, model, or mathematical or
+scientific idea works, even when it is unrelated to the current task. Details
+of local code and projects are out of scope. Each call appends an observation
+to a global queue, together with the project, session id, and index of the
+user's latest message, so a study session can revisit the transcript.
 
 ## Study sessions
 
-`/study` turns the current session into a study session, and `/study off` turns
-it back. The plugin runs the session; the agent calls `next_study_step` after
-each answer and does what it says. Each cycle has three parts:
+`/study` turns the current session into a study session and wakes the agent
+with the study tools, the study instructions, and a first step. `/study off`
+turns it back.
 
-1. **Review.** Up to two questions on nodes that are due, ranked by priority.
-2. **Probe.** Up to three questions that climb from the focus toward harder
-   nodes. A miss ends probing immediately, because a failed attempt helps
+The plugin keeps the session's rhythm, and the agent decides the content. After
+each answer, the agent records evidence with `record_understanding`; the first
+record for each user message is graded as the answer, and its result is the next
+step: review, probe, or teach, with the graph context behind it. That context
+lists candidate nodes with their evidence and hole or edge flags, nodes due for
+review, and untested observations. The agent reads them, explores the graph,
+and chooses what to ask or teach from the graph and the user's answers.
+
+Each cycle has three parts:
+
+1. **Review.** Up to two questions on nodes that are due.
+2. **Probe.** Up to three questions, each a step harder than the last correct
+   answer. A miss ends probing immediately, because a failed attempt helps
    learning only when the answer follows soon after.
-3. **Teach.** A short explanation of the missed node, or of the next step
-   beyond the last success, ending in a check question. A missed check is
+3. **Teach.** A short explanation of what the user missed, or of the next step
+   beyond their last success, ending in a check question. A missed check is
    retaught once from a different angle; then the node is left to review.
 
-Teaching uses a worked example when the material is new to the user, and a
-guided problem when its foundations are solid. If recent accuracy falls below
-75%, cycles probe only once and pick easier targets; above 90%, they aim
-harder. A long gap since the last step adds a one-line recap.
+If recent accuracy falls below 75%, cycles probe only once and the agent is
+told to ask easier questions; above 90%, harder ones. Probe candidates come
+from around the node the user last answered, so the session's focus follows
+the conversation. The study prompt tells the agent that the terminal renders
+Markdown, LaTeX, and Mermaid.
 
 | Tool | Purpose |
 | --- | --- |
-| `next_study_step` | Get the next step and its target node |
-| `set_study_focus` | Focus probing on a node and its neighbourhood |
-| `record_understanding` | Record evidence about a node after an answer |
+| `record_understanding` | Record evidence after an answer; returns the next step |
+| `view_knowledge` | Show a node, its neighbours, evidence, and review timing |
 | `search_knowledge` | Find existing nodes before adding one |
 | `add_knowledge` | Add a true statement, with its dependencies |
 | `add_dependency` | Link a node to one it depends on |
-| `view_knowledge` | Show a node, its neighbours, evidence, and review timing |
-| `find_study_targets` | Rank holes, edges, and nodes due for review |
-| `list_observations` | Show queued observations not yet handled |
 | `attach_observation` | Turn an observation into evidence on a node |
-| `dismiss_observation` | Drop an observation the user doesn't care about |
+| `dismiss_observation` | Drop an observation not worth studying |
 
 ## The graph is the only data structure
 

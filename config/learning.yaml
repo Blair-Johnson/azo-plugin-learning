@@ -8,17 +8,18 @@ cycle:
   probe_questions: 3
   # Times a node is taught before moving on and leaving it to review.
   max_teach_attempts: 2
-  # How far from the focus node probing may wander, in dependency links.
+  # How far from the last answered node to look for probe candidates, in
+  # dependency links.
   focus_hops: 2
-  # A gap this long since the last step earns a one-line recap.
-  recap_after_minutes: 20
+  # Candidate nodes and observations shown to the agent per step.
+  candidates: 6
 
 accuracy:
   # Recent graded answers used to judge whether questions are too hard.
   window_answers: 10
   window_hours: 12
   min_answers: 4
-  # Below low: one probe per cycle and easier targets. Above high: harder.
+  # Below low: one probe per cycle and easier questions. Above high: harder.
   low: 0.75
   high: 0.90
 

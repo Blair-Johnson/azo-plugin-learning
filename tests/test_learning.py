@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from agent_utils import PipelineBuilder, Session, core
+from agent_utils import PipelineBuilder, Session, core, interrupts
 from agent_utils.types import Entry
 
 import src.learning as plugin
@@ -45,10 +45,6 @@ def _session_state(tmp_path, *entries, study=False):
     )
     setattr(state, plugin.STUDY_FLAG, study)
     return state
-
-
-def _study_state():
-    return SimpleNamespace(**{plugin.STUDY_FLAG: True})
 
 
 def _build_session():
@@ -93,14 +89,27 @@ def _write_config(tmp_path, text):
     path.write_text(text)
 
 
-def _step(state, **kwargs):
-    return plugin.next_study_step.fn(state=state, **kwargs)
+def _start():
+    """Run /study on a bare session state and return (state, first step)."""
+
+    state = SimpleNamespace(entries=[_entry(0, "system", "sys")], pending_interrupts=[])
+    plugin._study_on(SimpleNamespace(state=state, session=None))
+    message = state.pending_interrupts[-1]
+    assert message.startswith(plugin.STUDY_START_MESSAGE)
+    return state, message.removeprefix(plugin.STUDY_START_MESSAGE)
 
 
-def _answer(state, node, understands):
+def _record(state, node, understands):
     return plugin.record_understanding.fn(
         node_id=node, understands=understands, evidence="answer", state=state
     )
+
+
+def _answer(state, node, understands):
+    """The user sends a message, and the agent records it on ``node``."""
+
+    state.entries.append(_entry(len(state.entries), "user", "answer"))
+    return _record(state, node, understands)
 
 
 # --- pipeline, visibility, commands, prompt ---------------------------------
@@ -127,13 +136,41 @@ def test_study_tools_are_hidden_without_the_flag():
     assert plugin.characterize_user_understanding.available(SimpleNamespace())
 
 
-def test_study_commands_toggle_the_flag():
-    ctx = SimpleNamespace(state=SimpleNamespace())
+def test_study_command_wakes_the_agent_with_study_tools_and_a_first_step():
+    session = Session(system_prompt="Base system")
+    builder = PipelineBuilder(session).add(core()).add(interrupts())
+    plugin.register_features(builder, session=session, config=SimpleNamespace())
+    session.pipeline = builder.build()
+    session.run()
+    ctx = SimpleNamespace(state=session.state, session=session)
+
+    def tool_names():
+        return {schema["function"]["name"] for schema in session.tool_schemas}
+
+    assert "characterize_user_understanding" in tool_names()
+    assert "record_understanding" not in tool_names()
+    assert not session.needs_reply
 
     plugin._study_on(ctx)
-    assert getattr(ctx.state, plugin.STUDY_FLAG) is True
+
+    # The idle runtime delivers interrupts without a full pipeline pass, so the
+    # command itself must have refreshed the published tools.
+    assert session.poll_interrupts()
+    assert "record_understanding" in tool_names()
+    assert "characterize_user_understanding" not in tool_names()
+    content = session.state.entries[-1].messages[0]["content"]
+    assert session.state.entries[-1].system_generated
+    assert "ran /study" in content and "Step: orient" in content
+    assert session.needs_reply
+    assert "# Study session" in session.messages[0]["content"]
+
+    assert "already on" in plugin._study_on(ctx).outputs[0].text
+    assert session.state.pending_interrupts == []
+
     plugin._study_off(ctx)
-    assert getattr(ctx.state, plugin.STUDY_FLAG) is False
+    assert getattr(session.state, plugin.STUDY_FLAG) is False
+    assert "record_understanding" not in tool_names()
+    assert "characterize_user_understanding" in tool_names()
 
 
 def test_study_instructions_render_only_during_study():
@@ -143,6 +180,14 @@ def test_study_instructions_render_only_during_study():
     setattr(session.state, plugin.STUDY_FLAG, True)
     assert session.rerender()[0]["content"] == "Base system" + plugin.STUDY_PROMPT
     assert session.state.entries[0].messages[0]["content"] == "Base system"
+
+
+def test_prompts_scope_knowledge_to_the_wider_world_and_mention_rendering():
+    observe = plugin.characterize_user_understanding.schema["function"]["description"]
+
+    assert "wider world" in observe and "on this machine" in observe
+    assert "wider world" in plugin.STUDY_PROMPT
+    assert "LaTeX" in plugin.STUDY_PROMPT and "```mermaid" in plugin.STUDY_PROMPT
 
 
 # --- config and storage ------------------------------------------------------
@@ -250,21 +295,20 @@ def test_rejects_invalid_observations(kwargs, message):
     assert _rows("observations") == []
 
 
-def test_observation_queue_attach_and_dismiss():
+def test_observation_attach_and_dismiss():
     for topic, understands in (("lifetimes", False), ("borrowing", True), ("macros", False)):
         plugin.characterize_user_understanding.fn(
             topic=topic, evidence=f"said something about {topic}", understands=understands
         )
     node = _add("A reference cannot outlive the value it borrows.")
 
-    assert "observation 1" in plugin.list_observations.fn()
     assert plugin.attach_observation.fn(observation_id=1, node_id=node).startswith("Attached")
     assert "already attached" in plugin.attach_observation.fn(observation_id=1, node_id=node)
     assert plugin.dismiss_observation.fn(observation_id=3).startswith("Dismissed")
 
-    pending = plugin.list_observations.fn()
-    assert "observation 2" in pending
-    assert "observation 1" not in pending and "observation 3" not in pending
+    _, step = _start()
+    assert "observation 2" in step
+    assert "observation 1" not in step and "observation 3" not in step
     [evidence] = _rows("evidence")
     [observation] = [row for row in _rows("observations") if row["id"] == 1]
     assert evidence["source_kind"] == "observation"
@@ -281,13 +325,14 @@ def test_add_search_and_view_knowledge(tmp_path):
     )
     state = _session_state(tmp_path, _entry(0, "user", "threads share one GIL, right?"), study=True)
 
-    assert _answer(state, top, True) == "Recorded."
+    assert _record(state, top, True).startswith("Recorded.")
     found = plugin.search_knowledge.fn(query="threads in parallel")
     assert f"node {top}:" in found
     view = plugin.view_knowledge.fn(node_id=base)
     assert "Depended on by:" in view and f"node {top}:" in view
+    assert "possible hole" in view
     view = plugin.view_knowledge.fn(node_id=top)
-    assert "understands (study; project demo, session session-1, entry 0)" in view
+    assert "understands (study; project demo, session session-1, entry 0" in view
     assert "review interval 1 days" in view
 
 
@@ -331,8 +376,9 @@ def test_untested_foundation_under_known_node_is_a_hole():
 
     states = _states()
     assert states[foundation].hole_score > states[tested_foundation].hole_score
-    holes = plugin.find_study_targets.fn().split("Edges")[0]
-    assert holes.index(f"node {foundation}:") < holes.index(f"node {tested_foundation}:")
+    _, step = _start()
+    assert "Possible holes and edges across the graph" in step
+    assert step.index(f"node {foundation}:") < step.index(f"node {tested_foundation}:")
 
 
 def test_failed_node_on_solid_foundation_is_an_edge():
@@ -348,8 +394,8 @@ def test_failed_node_on_solid_foundation_is_an_edge():
     states = _states()
     assert states[failed].edge_score > states[failed_on_shaky].edge_score
     assert states[solid].edge_score == 0
-    edges = plugin.find_study_targets.fn().split("Edges")[1]
-    assert f"node {failed}:" in edges
+    _, step = _start()
+    assert f"possible edge [{states[failed].edge_score:.2f}]; node {failed}:" in step
 
 
 def test_review_interval_grows_with_spaced_successes_and_resets_on_a_miss():
@@ -375,196 +421,167 @@ def test_review_interval_grows_with_spaced_successes_and_resets_on_a_miss():
     assert states[lapsed].interval_days == 1.0
 
 
-def test_due_nodes_are_ranked_by_priority_not_queued():
+def test_due_nodes_are_offered_by_priority_not_queued():
     for days in (1.5, 3, 6):
         _evidence(_add(f"seen {days} days ago"), True, days_ago=days)
     _evidence(_add("not due"), True, hours_ago=2)
 
-    due = plugin.find_study_targets.fn().split("Due for review")[1]
+    _, step = _start()
 
-    assert "(3):" in due
-    assert due.index("seen 6 days ago") < due.index("seen 3 days ago") < due.index("seen 1.5")
-    assert "not due" not in due
+    assert step.startswith("Step: review (question 1 of up to 2")
+    assert step.index("seen 6 days ago") < step.index("seen 3 days ago") < step.index("seen 1.5")
+    assert "not due" not in step
 
 
 # --- the study cycle ---------------------------------------------------------
 
-def test_empty_graph_asks_what_to_study_then_probes_the_focus():
-    state = _study_state()
+def test_empty_graph_orients_then_the_first_answer_drives_the_cycle():
+    state, step = _start()
+    assert step.startswith("Step: orient")
 
-    assert _step(state).startswith("Step: orient")
+    state.entries.append(_entry(len(state.entries), "user", "I want to learn Mamba-3"))
     node = _add("Mamba-3 uses an exponential-trapezoidal discretization.")
-    assert plugin.set_study_focus.fn(node_id=node, state=state).startswith("Focus set")
-    step = _step(state)
+    result = _answer(state, node, False)
 
-    assert step.startswith("Step: probe (question 1 of up to 3")
-    assert f"node {node}:" in step
-
-
-def test_step_refuses_to_advance_until_the_answer_is_recorded():
-    state = _study_state()
-    node = _add("A")
-    plugin.set_study_focus.fn(node_id=node, state=state)
-    _step(state)
-
-    assert "hasn't been recorded" in _step(state)
-    assert _answer(state, node, False).startswith("Recorded as the answer")
-    assert _step(state).startswith("Step: teach")
+    assert result.startswith("Recorded. Next:\nStep: teach")
+    assert f"missed node {node}" in result
 
 
-def test_only_the_targeted_node_counts_as_the_answer():
-    state = _study_state()
+def test_only_the_first_record_for_each_user_message_advances_the_cycle():
     target, other = _add("target"), _add("other")
-    plugin.set_study_focus.fn(node_id=target, state=state)
-    _step(state)
+    state, _ = _start()
 
-    assert _answer(state, other, False) == "Recorded."
-    assert _answer(state, target, True).startswith("Recorded as the answer")
+    assert _answer(state, target, False).startswith("Recorded. Next:")
+    assert _record(state, other, True) == "Recorded."
     phases = {row["node_id"]: row["question_phase"] for row in _rows("evidence")}
-    assert phases == {other: None, target: "probe"}
+    assert phases == {target: "probe", other: None}
 
 
-def test_probe_miss_is_taught_immediately_and_check_ends_the_cycle():
-    state = _study_state()
+def test_messages_from_before_study_are_not_answers():
+    node = _add("node")
+    state = SimpleNamespace(
+        entries=[_entry(0, "system", "sys"), _entry(1, "user", "earlier chat")],
+        pending_interrupts=[],
+    )
+    plugin._study_on(SimpleNamespace(state=state, session=None))
+
+    assert _record(state, node, True) == "Recorded."
+    assert _answer(state, node, True).startswith("Recorded. Next:")
+
+
+def test_records_outside_study_never_advance():
+    node = _add("node")
+    state = SimpleNamespace(entries=[_entry(0, "user", "hi")])
+
+    assert _record(state, node, True) == "Recorded."
+
+
+def test_probe_miss_is_taught_with_its_foundations_and_check_ends_the_cycle():
     base = _add("base")
     node = _add("node", depends_on=[base])
     _evidence(base, True, hours_ago=1)
-    plugin.set_study_focus.fn(node_id=node, state=state)
-    _step(state)
-    _answer(state, node, False)
+    state, _ = _start()
 
-    teach = _step(state)
-    assert "just missed node" in teach
-    assert f"node {base}: base" in teach
-    assert "guided problem" in teach or "small problem" in teach
+    teach = _answer(state, node, False)
+    assert "Step: teach" in teach and f"missed node {node}: node" in teach
+    assert "It rests on:" in teach and f"node {base}: base" in teach
+    assert "worked example" in teach
 
-    _answer(state, node, True)
-    after = _step(state)
+    after = _answer(state, node, True)
     assert "recorded as correct" in after
     assert "Step: probe" in after and state.learning_study_cycle["probes_done"] == 0
+    assert f"Nodes near node {node}" in after and f"node {base}: base" in after
 
 
-def test_correct_probes_climb_dependents_then_teach_beyond():
-    state = _study_state()
+def test_correct_probes_show_what_builds_on_them_then_teach_beyond():
     a = _add("a")
     b = _add("b", depends_on=[a])
     c = _add("c", depends_on=[b])
-    plugin.set_study_focus.fn(node_id=a, state=state)
+    state, _ = _start()
 
-    assert f"node {a}:" in _step(state)
-    _answer(state, a, True)
-    assert f"node {b}:" in _step(state)
-    _answer(state, b, True)
-    assert f"node {c}:" in _step(state)
-    _answer(state, c, True)
-    teach = _step(state)
+    step = _answer(state, a, True)
+    assert f"answered node {a} correctly" in step and f"node {b}: b" in step
+    step = _answer(state, b, True)
+    assert f"answered node {b} correctly" in step and f"node {c}: c" in step
+    teach = _answer(state, c, True)
 
     assert "Step: teach" in teach and f"ending at node {c}" in teach
-    assert state.learning_study_cycle["node_id"] is None
+
+
+def test_the_agent_may_answer_on_a_different_node_than_suggested():
+    a = _add("a")
+    unrelated = _add("unrelated")
+    state, _ = _start()
+
+    step = _answer(state, unrelated, True)
+
+    assert f"answered node {unrelated} correctly" in step
+    assert state.learning_study_cycle["anchor_node_id"] == unrelated
+    assert a not in state.learning_study_cycle["asked"]
 
 
 def test_reteaches_then_moves_on_after_max_attempts():
-    state = _study_state()
     node = _add("hard")
-    plugin.set_study_focus.fn(node_id=node, state=state)
-    _step(state)
-    _answer(state, node, False)
-    _step(state)
+    state, _ = _start()
     _answer(state, node, False)
 
-    assert "different angle" in _step(state)
-    _answer(state, node, False)
-    after = _step(state)
+    assert "different angle" in _answer(state, node, False)
+    after = _answer(state, node, False)
 
     assert "still hasn't landed" in after
     assert "Step: teach" not in after
 
 
 def test_cycle_starts_with_due_reviews_then_probes():
-    state = _study_state()
     due = _add("due")
     fresh = _add("fresh")
     _evidence(due, True, days_ago=3)
     _evidence(fresh, False)
+    state, review = _start()
 
-    review = _step(state)
-    assert review.startswith("Step: review (question 1 of up to 2")
-    assert f"node {due}:" in review
-    _answer(state, due, True)
-    after = _step(state)
+    assert review.startswith("Step: review")
+    assert f"node {due}: due" in review
+    after = _answer(state, due, True)
 
     assert "recorded as correct" in after and "Step: probe" in after
 
 
 def test_review_miss_is_corrected_and_rechecked():
-    state = _study_state()
     node = _add("forgotten")
     _evidence(node, True, days_ago=5)
-    _step(state)
-    _answer(state, node, False)
+    state, _ = _start()
 
-    teach = _step(state)
+    teach = _answer(state, node, False)
 
     assert f"missed node {node} in review" in teach
     assert state.learning_study_cycle["phase"] == "teach"
-    assert state.learning_study_cycle["node_id"] == node
 
 
 def test_low_accuracy_limits_probing_to_one_question():
-    state = _study_state()
     filler = _add("filler")
     for _ in range(5):
         _evidence(filler, False, hours_ago=1, phase="probe")
     node = _add("node")
-    plugin.set_study_focus.fn(node_id=node, state=state)
-    step = _step(state)
+    state, step = _start()
 
     assert "of up to 1 before teaching" in step
     assert "below the 75% target" in step
-    _answer(state, node, True)
-    assert "Step: teach" in _step(state)
+    assert "Step: teach" in _answer(state, node, True)
 
 
-def test_probing_tests_pending_observations_without_a_focus():
-    state = _study_state()
+def test_probe_offers_untested_observations():
     plugin.characterize_user_understanding.fn(
         topic="selective scan", evidence="asked what it was", understands=False
     )
 
-    step = _step(state)
+    _, step = _start()
 
     assert "observation 1" in step and "attach_observation" in step
 
 
-def test_skip_moves_on_without_an_answer():
-    state = _study_state()
-    node = _add("node")
-    plugin.set_study_focus.fn(node_id=node, state=state)
-    _step(state)
-
-    step = _step(state, skip=True)
-
-    assert step.startswith("Step: probe (question 2")
-
-
-def test_long_gap_adds_a_recap_note():
-    state = _study_state()
-    node = _add("node")
-    plugin.set_study_focus.fn(node_id=node, state=state)
-    _step(state)
-    _answer(state, node, True)
-    old = datetime.now(timezone.utc) - timedelta(minutes=45)
-    state.learning_study_cycle["issued_at"] = old.isoformat(timespec="seconds")
-
-    assert "since the last step" in _step(state)
-
-
 def test_config_changes_cycle_lengths(tmp_path):
     _write_config(tmp_path, "cycle:\n  probe_questions: 1\n")
-    state = _study_state()
     node = _add("node")
-    plugin.set_study_focus.fn(node_id=node, state=state)
-    _step(state)
-    _answer(state, node, True)
+    state, _ = _start()
 
-    assert "Step: teach" in _step(state)
+    assert "Step: teach" in _answer(state, node, True)

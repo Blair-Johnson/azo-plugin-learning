@@ -6,8 +6,10 @@ Working agents record passive observations with
 ``/study`` turns the current session into a study session. Study sessions see
 a different tool set: they build a knowledge graph of true statements linked
 by dependencies, and record evidence of understanding against its nodes.
-``next_study_step`` runs the session as a repeating cycle of review, probing,
-and teaching, so the user only has to answer and learn.
+The plugin keeps the session's rhythm, a repeating cycle of review, probing,
+and teaching: recording the user's answer returns the next step together with
+the graph context behind it. The agent chooses what to ask and teach by
+reading the graph and the user's answers.
 
 The graph is the only learning data structure. Nothing stores a schedule or a
 mastery score: each node's review timing, hole and edge scores are derived from
@@ -42,7 +44,7 @@ from agent_zoo.runtime.commands import Command, CommandResult
 _PLUGIN_NAME = "azo-plugin-learning"
 STUDY_FLAG = "learning_study_active"
 CYCLE = "learning_study_cycle"
-QUESTION_PHASES = ("review", "probe", "teach")
+QUESTION_PHASES = ("review", "probe", "teach", "orient")
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +59,11 @@ DEFAULT_CONFIG: dict[str, dict[str, float | int]] = {
         "probe_questions": 3,
         # Times a node is taught before moving on and leaving it to review.
         "max_teach_attempts": 2,
-        # How far from the focus node probing may wander, in dependency links.
+        # How far from the last answered node to look for probe candidates,
+        # in dependency links.
         "focus_hops": 2,
-        # A gap this long since the last step earns a one-line recap.
-        "recap_after_minutes": 20,
+        # Candidate nodes and observations shown to the agent per step.
+        "candidates": 6,
     },
     "accuracy": {
         # Recent answers used to judge whether questions are too hard or easy.
@@ -541,6 +544,12 @@ def characterize_user_understanding(
     catching a mistake you made. It returns immediately and does not affect
     your work; you do not need to mention it to the user.
 
+    Only record knowledge about the wider world that is worth the user
+    internalizing: how a technology, algorithm, model architecture, protocol,
+    mathematical idea, or scientific concept works. Do not record knowledge
+    of the code, files, configuration, or project details on this machine,
+    such as what a local function does or where a setting lives.
+
     Args:
         topic: A specific description of what the user does or doesn't
             understand, as precise as the evidence allows. For example,
@@ -607,8 +616,8 @@ def add_knowledge(statement: str, depends_on: list[int] | None = None, state=Non
     """Add a node to the user's knowledge graph.
 
     Search with search_knowledge first. A node is one true, specific,
-    self-contained statement, worded objectively rather than about the
-    user. Record a misconception as the correct statement, then record
+    self-contained statement about the wider world, worded objectively
+    rather than about the user, never about code or files on this machine. Record a misconception as the correct statement, then record
     evidence that the user doesn't understand it.
 
     Args:
@@ -680,11 +689,11 @@ def add_dependency(node_id: int, depends_on_id: int, state=None) -> str:
 def record_understanding(node_id: int, understands: bool, evidence: str, state=None) -> str:
     """Record evidence of whether the user understands a node.
 
-    Call this after every answer, for each node the answer bears on, before
-    calling next_study_step. If the current study step named a node, record
-    evidence on that node; if it didn't, record the node your question asked
-    about first. The harness records the time and a pointer to the user's
-    latest message.
+    Call this after every answer, for each node the answer bears on. Record
+    the node your question asked about first: the first record for each
+    user message is graded as their answer, and its result tells you what to
+    do next. The harness records the time and a pointer to the user's latest
+    message.
 
     Args:
         node_id: The node the evidence is about.
@@ -699,38 +708,38 @@ def record_understanding(node_id: int, understands: bool, evidence: str, state=N
     if not isinstance(understands, bool):
         return "ERROR: understands must be true or false."
 
-    # The first matching row after a question step is that question's answer.
-    cycle = getattr(state, CYCLE, None) if state is not None else None
-    phase = None
-    if (
-        isinstance(cycle, dict)
-        and cycle.get("phase") in QUESTION_PHASES
-        and cycle.get("answer_evidence_id") is None
-        and cycle.get("node_id") in (None, node_id)
-    ):
-        phase = cycle["phase"]
-    row = (
-        node_id, int(understands), fields["evidence"], _timestamp(), *_pointer(state), phase,
+    pointer = _pointer(state)
+    cycle = _cycle(state) if state is not None else None
+    # The first record for each user message is the answer that advances the
+    # cycle; later records on the same message are extra evidence.
+    answers = (
+        cycle is not None
+        and getattr(state, STUDY_FLAG, False)
+        and (pointer[2] is None or pointer[2] != cycle.get("answered_entry"))
     )
+    phase = cycle.get("phase") if answers else None
+    row = (
+        node_id, int(understands), fields["evidence"], _timestamp(), *pointer,
+        phase if phase in QUESTION_PHASES else None,
+    )
+    cfg = load_config()
 
     def work(conn):
         if _missing_nodes(conn, (node_id,)):
-            return None, f"ERROR: no node with id {node_id}."
+            return f"ERROR: no node with id {node_id}."
         evidence_id = conn.execute(
             "INSERT INTO evidence (node_id, understands, evidence, observed_at, source_kind,"
             " project, session_id, user_entry_index, question_phase)"
             " VALUES (?, ?, ?, ?, 'study', ?, ?, ?, ?)",
             row,
         ).lastrowid
-        return evidence_id, None
+        if not answers:
+            return "Recorded."
+        cycle["answered_entry"] = pointer[2]
+        answer = conn.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
+        return "Recorded. Next:\n" + _advance(conn, cycle, cfg, _now(), answer)
 
-    evidence_id, error = _run(work)
-    if error:
-        return error
-    if phase is not None:
-        cycle["answer_evidence_id"] = evidence_id
-        return f"Recorded as the answer to the current {phase} step."
-    return "Recorded."
+    return _run(work)
 
 
 @_learning_tool(study=True)
@@ -748,11 +757,15 @@ def view_knowledge(node_id: int, state=None) -> str:
         node = states.get(node_id)
         if node is None:
             return f"ERROR: no node with id {node_id}."
-        lines = [_describe(node), _describe_review(node, now)]
+        lines = [f"{_flag(node)}{_describe(node)}", _describe_review(node, now)]
         lines.append("Depends on:")
-        lines += [f"  {_describe(states[p])}" for p in node.depends_on] or ["  nothing"]
+        lines += [
+            f"  {_flag(states[p])}{_describe(states[p])}" for p in node.depends_on
+        ] or ["  nothing"]
         lines.append("Depended on by:")
-        lines += [f"  {_describe(states[d])}" for d in node.dependents] or ["  nothing"]
+        lines += [
+            f"  {_flag(states[d])}{_describe(states[d])}" for d in node.dependents
+        ] or ["  nothing"]
         lines.append("Evidence, newest first:")
         rows = conn.execute(
             "SELECT * FROM evidence WHERE node_id = ? ORDER BY observed_at DESC, id DESC",
@@ -774,74 +787,6 @@ def view_knowledge(node_id: int, state=None) -> str:
         return "\n".join(lines)
 
     return _run(work)
-
-
-@_learning_tool(study=True)
-def find_study_targets(limit: int = 8, state=None) -> str:
-    """Rank the holes, edges, and nodes due for review in the knowledge graph.
-
-    next_study_step already chooses targets; use this to explain the state
-    of the graph to the user.
-
-    A hole is a node that things the user understands depend on, but whose
-    own evidence is thin, old, or negative. An edge is a node the user
-    failed or hasn't been tested on, whose foundations look solid.
-
-    Args:
-        limit: Maximum number of nodes to return in each list.
-    """
-
-    limit = max(1, min(int(limit), 50))
-    now = _now()
-    cfg = load_config()
-
-    def work(conn):
-        states = list(node_states(conn, now, cfg).values())
-        pending = len(conn.execute(_PENDING_OBSERVATIONS).fetchall())
-        return states, pending
-
-    states, pending = _run(work)
-    holes = sorted((s for s in states if s.hole_score > 0), key=lambda s: -s.hole_score)
-    hole_ids = {s.id for s in holes}
-    edges = sorted(
-        (s for s in states if s.edge_score > 0 and s.id not in hole_ids),
-        key=lambda s: -s.edge_score,
-    )
-    due = sorted(
-        (s for s in states if s.last_evidence and s.urgency >= cfg["review"]["due_ratio"]),
-        key=lambda s: -s.review_priority,
-    )
-
-    lines = [f"Holes ({len(holes)}):"]
-    lines += [
-        f"  [{s.hole_score:.2f}] {_describe(s)}; {len(s.dependents)} dependent(s)"
-        for s in holes[:limit]
-    ] or ["  none"]
-    lines.append(f"Edges ({len(edges)}):")
-    lines += [f"  [{s.edge_score:.2f}] {_describe(s)}" for s in edges[:limit]] or ["  none"]
-    lines.append(f"Due for review ({len(due)}):")
-    lines += [
-        f"  [{s.review_priority:.2f}] {_describe(s)}; {_describe_review(s, now)}"
-        for s in due[:limit]
-    ] or ["  none"]
-    lines.append(f"Pending observations: {pending}")
-    return "\n".join(lines)
-
-
-@_learning_tool(study=True)
-def list_observations(limit: int = 30, state=None) -> str:
-    """List passive observations that working agents made about the user and
-    that have not been attached to a node or dismissed, oldest first.
-
-    Args:
-        limit: Maximum number of observations to return.
-    """
-
-    limit = max(1, min(int(limit), 200))
-    rows = _run(lambda conn: conn.execute(_PENDING_OBSERVATIONS + " LIMIT ?", (limit,)).fetchall())
-    if not rows:
-        return "No pending observations."
-    return "\n".join(_describe_observation(row) for row in rows)
 
 
 def _describe_observation(row: sqlite3.Row) -> str:
@@ -930,15 +875,13 @@ def _cycle(state) -> dict:
 
 def _new_cycle(cycle: dict) -> None:
     cycle.update(
-        phase="", node_id=None, issued_at=None, answer_evidence_id=None,
+        phase="", node_id=None,
         reviews_done=0, probes_done=0, teach_attempts=0, asked=[], last_probe=None,
     )
 
 
-def _issue(cycle: dict, phase: str, node_id: int | None, now: datetime) -> None:
-    cycle.update(
-        phase=phase, node_id=node_id, issued_at=_timestamp(now), answer_evidence_id=None
-    )
+def _issue(cycle: dict, phase: str, node_id: int | None) -> None:
+    cycle.update(phase=phase, node_id=node_id)
 
 
 def _accuracy(conn, cfg, now) -> tuple[int, int, str | None]:
@@ -985,33 +928,30 @@ def _probe_limit(cfg, accuracy) -> int:
 
 
 def _transition(cycle, phase, answer, cfg, accuracy, notes) -> tuple[str, dict | None]:
-    """Record the outcome of the open step and return what comes next."""
+    """Count the answer against the open step and return the next phase."""
 
-    if answer is not None:
-        node = answer["node_id"]
-        understands = bool(answer["understands"])
+    node = answer["node_id"] if answer is not None else None
+    understands = bool(answer["understands"]) if answer is not None else True
+    if node is not None:
+        cycle["asked"].append(node)
+        # The session's focus follows whatever the user last answered.
+        cycle["anchor_node_id"] = node
     if phase == "review":
         cycle["reviews_done"] += 1
-        if answer is not None:
-            cycle["asked"].append(node)
-            if not understands:
-                return "teach", {"node_id": node, "reason": "review_miss"}
+        if not understands:
+            return "teach", {"node_id": node, "reason": "review_miss"}
         return "review", None
-    if phase == "probe":
+    if phase in ("probe", "orient"):
         cycle["probes_done"] += 1
-        limit = _probe_limit(cfg, accuracy)
-        if answer is None:
-            return ("probe" if cycle["probes_done"] < limit else "new"), None
-        cycle["asked"].append(node)
         cycle["last_probe"] = {"node_id": node, "understands": understands}
         if not understands:
             return "teach", {"node_id": node, "reason": "probe_miss"}
-        if cycle["probes_done"] >= limit:
-            return "teach", {"node_id": None, "reason": "beyond", "beyond_node_id": node}
+        if cycle["probes_done"] >= _probe_limit(cfg, accuracy):
+            return "teach", {"node_id": node, "reason": "beyond"}
         return "probe", None
     if phase == "teach":
         cycle["teach_attempts"] += 1
-        if answer is not None and not understands:
+        if not understands:
             if cycle["teach_attempts"] < max(int(cfg["cycle"]["max_teach_attempts"]), 1):
                 return "teach", {"node_id": node, "reason": "reteach"}
             notes.append(
@@ -1019,12 +959,14 @@ def _transition(cycle, phase, answer, cfg, accuracy, notes) -> tuple[str, dict |
                 " it will come back in review, and move on."
             )
         return "new", None
-    if phase in ("orient", "focus"):
-        return "probe", None
     return "new", None
 
 
-def _pick_review(states, cycle, cfg) -> NodeState | None:
+def _limit(cfg) -> int:
+    return max(int(cfg["cycle"]["candidates"]), 1)
+
+
+def _due(states, cycle, cfg) -> list[NodeState]:
     asked = set(cycle["asked"])
     due = [
         s for s in states.values()
@@ -1032,7 +974,7 @@ def _pick_review(states, cycle, cfg) -> NodeState | None:
         and s.id not in asked
         and s.urgency >= cfg["review"]["due_ratio"]
     ]
-    return max(due, key=lambda s: (s.review_priority, -s.id), default=None)
+    return sorted(due, key=lambda s: (-s.review_priority, s.id))[: _limit(cfg)]
 
 
 def _neighbourhood(states, start: int, hops: int) -> set[int]:
@@ -1045,213 +987,160 @@ def _neighbourhood(states, start: int, hops: int) -> set[int]:
     return seen
 
 
-def _pick_probe(conn, cycle, states, cfg, accuracy):
-    """Return (node, observation, beyond) for the next probe.
+def _flag(state: NodeState) -> str:
+    if state.hole_score > 0 and state.hole_score >= state.edge_score:
+        return f"possible hole [{state.hole_score:.2f}]; "
+    if state.edge_score > 0:
+        return f"possible edge [{state.edge_score:.2f}]; "
+    return ""
 
-    At most one is set. ``beyond`` is a node the user just got right that has
-    nothing built on it yet, so the agent must add the next step itself.
-    """
+
+def _candidate_lines(states, cycle, cfg) -> tuple[str, list[str]]:
+    """Nodes worth considering for the next probe, with what the graph knows."""
 
     asked = set(cycle["asked"])
-    last = cycle.get("last_probe")
-    if last and last["understands"] and last["node_id"] in states:
-        base = states[last["node_id"]]
-        harder = [states[d] for d in base.dependents if d not in asked]
-        if harder:
-            return max(harder, key=lambda s: (s.edge_score + s.hole_score, -s.weight)), None, None
-        return None, None, base
-
-    focus = cycle.get("focus_node_id")
-    if focus in states:
-        pool = _neighbourhood(states, focus, int(cfg["cycle"]["focus_hops"]))
+    anchor = cycle.get("anchor_node_id")
+    if anchor in states:
+        pool = _neighbourhood(states, anchor, int(cfg["cycle"]["focus_hops"])) - asked
+        heading = f"Nodes near node {anchor}, where the user last answered:"
     else:
-        observation = conn.execute(_PENDING_OBSERVATIONS + " LIMIT 1").fetchone()
-        if observation is not None:
-            return None, observation, None
-        pool = set(states)
-
-    candidates = [states[n] for n in pool if n not in asked]
-    if not candidates:
-        return None, None, None
-    if accuracy[2] == "low":
-        key = lambda s: (s.known_below - s.doubt_below, -s.weight)  # noqa: E731
-    else:
-        key = lambda s: (s.edge_score + s.hole_score, -s.weight)  # noqa: E731
-    return max(candidates, key=key), None, None
+        pool = {s.id for s in states.values() if s.hole_score > 0 or s.edge_score > 0} - asked
+        heading = "Possible holes and edges across the graph:"
+    ranked = sorted(
+        (states[n] for n in pool),
+        key=lambda s: (-(s.hole_score + s.edge_score), s.weight, s.id),
+    )[: _limit(cfg)]
+    return heading, [f"  {_flag(s)}{_describe(s)}" for s in ranked]
 
 
 _FINISH_QUESTION = "End your turn after asking."
 
 
-def _review_step(cycle, node, cfg, now, accuracy) -> list[str]:
-    _issue(cycle, "review", node.id, now)
+def _review_step(cycle, due, cfg, now, accuracy) -> list[str]:
+    _issue(cycle, "review", None)
     return [
         f"Step: review (question {cycle['reviews_done'] + 1} of up to "
         f"{cfg['cycle']['review_questions']} this cycle)",
-        _describe(node),
-        _describe_review(node, now),
+        "These nodes are due for review, most urgent first:",
+        *[f"  {_describe(s)}; {_describe_review(s, now)}" for s in due],
+        "Choose one to review. Prefer a node connected to what the user has been"
+        " studying, or one that other nodes rest on. Ask a question that makes the user"
+        " recall or apply it from memory, without giving the answer away; applying it"
+        " to a new situation beats restating it.",
         _accuracy_line(accuracy, cfg),
-        "Ask one question that makes the user recall or apply this node from memory,"
-        " without giving the answer away. Prefer applying it to a new situation over"
-        " restating it. " + _FINISH_QUESTION,
+        _FINISH_QUESTION,
     ]
 
 
-def _probe_step(conn, cycle, states, cfg, now, accuracy) -> list[str]:
-    node, observation, beyond = _pick_probe(conn, cycle, states, cfg, accuracy)
-    header = (
-        f"Step: probe (question {cycle['probes_done'] + 1} of up to "
-        f"{_probe_limit(cfg, accuracy)} before teaching)"
-    )
-    record_first = "Record the user's answer on that node first."
-    if node is not None:
-        _issue(cycle, "probe", node.id, now)
-        lines = [
-            header,
-            _describe(node),
-            "Ask one question about this node that finds where the user's understanding"
-            " runs out.",
-        ]
-    elif observation is not None:
-        _issue(cycle, "probe", None, now)
-        lines = [
-            header,
-            _describe_observation(observation),
-            "Find or add the node this observation concerns, attach the observation to it"
-            " with attach_observation, and ask one question that tests it. " + record_first,
-        ]
-    elif beyond is not None:
-        _issue(cycle, "probe", None, now)
-        lines = [
-            header,
-            f"The user got node {beyond.id} right, and nothing in the graph builds on it"
-            f" yet: {beyond.statement}",
-            f"Ask about the next step beyond it. Add a node that depends on node"
-            f" {beyond.id} if needed. " + record_first,
-        ]
-    elif not states:
-        _issue(cycle, "orient", None, now)
+def _probe_step(conn, cycle, states, cfg, accuracy) -> list[str]:
+    observations = conn.execute(
+        _PENDING_OBSERVATIONS + " LIMIT ?", (_limit(cfg),)
+    ).fetchall()
+    if not states and not observations:
+        _issue(cycle, "orient", None)
         return [
             "Step: orient",
             "The knowledge graph is empty and there are no observations to test.",
-            "Ask the user what they would like to study. When they answer, add a node for"
-            " it with add_knowledge, call set_study_focus with its id, and then call"
-            " next_study_step.",
+            "Ask the user what they would like to study. When they answer, find or add a"
+            " node for it and ask one question that finds where their understanding of it"
+            " runs out. " + _FINISH_QUESTION,
         ]
+
+    _issue(cycle, "probe", None)
+    lines = [
+        f"Step: probe (question {cycle['probes_done'] + 1} of up to "
+        f"{_probe_limit(cfg, accuracy)} before teaching)"
+    ]
+    last = cycle.get("last_probe")
+    if last and last["understands"] and last["node_id"] in states:
+        base = states[last["node_id"]]
+        lines.append(f"The user just answered node {base.id} correctly: {base.statement}")
+        built = [states[d] for d in base.dependents if d not in cycle["asked"]]
+        if built:
+            lines.append("Nodes built on it:")
+            lines += [f"  {_flag(s)}{_describe(s)}" for s in built[: _limit(cfg)]]
+        lines.append(
+            "Ask something a step harder than what they just showed. If the graph doesn't"
+            " have that step yet, add it."
+        )
     else:
-        _issue(cycle, "probe", None, now)
-        lines = [
-            header,
-            "Every nearby node has been asked about this cycle.",
-            "Ask about something new near the focus, or near what the user has studied"
-            " recently. Search the graph and add a node if needed. " + record_first,
-        ]
+        heading, candidates = _candidate_lines(states, cycle, cfg)
+        if candidates:
+            lines.append(heading)
+            lines += candidates
+        if observations:
+            lines.append("Untested observations from the user's work:")
+            lines += [f"  {_describe_observation(row)}" for row in observations]
+            lines.append(
+                "To test an observation, find or add the node it concerns and attach it"
+                " with attach_observation."
+            )
+        lines.append(
+            "Choose what to probe by reading these, the user's recent answers, and the"
+            " graph around them with view_knowledge and search_knowledge. Ask one question"
+            " that finds where the user's understanding runs out."
+        )
     lines.append(_accuracy_line(accuracy, cfg))
     lines.append("Decide the correct answer before asking. " + _FINISH_QUESTION)
     return lines
 
 
-_TEACH_FORMATS = {
-    "worked example": (
-        "This material is new to the user, so teach with a worked example: walk through"
-        " one concrete instance step by step, then state the general point."
-    ),
-    "guided problem": (
-        "The user's foundations here are solid, so explain briefly and make the check"
-        " question a small problem that needs this step, with a hint."
-    ),
-}
-
-
-def _teach_format(node: NodeState | None, beyond: NodeState | None) -> str:
-    if node is None:
-        return "guided problem" if beyond is not None and beyond.net > 0 else "worked example"
-    if node.net > 0 or (node.known_below > 0 and node.doubt_below == 0):
-        return "guided problem"
-    return "worked example"
-
-
-def _teach_step(cycle, states, now, teach) -> list[str]:
-    node = states.get(teach["node_id"]) if teach["node_id"] is not None else None
-    beyond = states.get(teach.get("beyond_node_id"))
-    if teach["reason"] != "reteach":
-        cycle["teach_attempts"] = 0
-    _issue(cycle, "teach", node.id if node else None, now)
-
+def _teach_step(cycle, states, teach) -> list[str]:
     reason = teach["reason"]
+    node = states.get(teach["node_id"])
+    if reason != "reteach":
+        cycle["teach_attempts"] = 0
+    _issue(cycle, "teach", None)
+
     lines = ["Step: teach"]
-    if reason == "probe_miss":
+    if node is None:
+        lines.append("Teach the step the user's last answer showed they are missing.")
+    elif reason == "probe_miss":
         lines.append(
-            f"The user just missed node {node.id}. Say briefly what was wrong in their"
-            " answer, then teach it."
+            f"The user missed node {node.id}: {node.statement}\nSay briefly what was wrong,"
+            " then teach the step they are missing. Usually that is this node, but if"
+            " their reasoning showed a gap in something it rests on, teach that first."
         )
     elif reason == "review_miss":
         lines.append(
-            f"The user missed node {node.id} in review. Correct it briefly, then teach it"
-            " again."
+            f"The user missed node {node.id} in review: {node.statement}\nCorrect it"
+            " briefly, then teach it again, or the prerequisite their answer showed they"
+            " lack."
         )
     elif reason == "reteach":
         lines.append(
-            f"The user missed the check on node {node.id} too. Teach it again from a"
-            " different angle, more simply."
+            f"The user missed the check on node {node.id} too: {node.statement}\nTeach it"
+            " again from a different angle and more simply, or teach a prerequisite their"
+            " answer showed they lack."
         )
-    elif beyond is not None:
-        lines.append(
-            f"The user answered every probe correctly, ending at node {beyond.id}:"
-            f" {beyond.statement}"
-        )
-        lines.append(
-            f"Teach the next step beyond it. First add a node for that step that depends"
-            f" on node {beyond.id}."
-        )
-    if node is not None:
-        lines.append(_describe(node))
-        known = [states[p] for p in node.depends_on if states[p].net > 0]
     else:
-        known = [beyond] if beyond is not None else []
-    if known:
         lines.append(
-            "Build from what the user already holds: "
-            + "; ".join(f"node {k.id}: {k.statement}" for k in known)
+            f"The user answered every probe correctly, ending at node {node.id}:"
+            f" {node.statement}\nTeach the next step beyond what they showed. Add a node"
+            " for it if the graph doesn't have one."
         )
-    lines.append(_TEACH_FORMATS[_teach_format(node, beyond)])
+    if node is not None and node.depends_on:
+        lines.append("It rests on:")
+        lines += [f"  {_describe(states[p])}" for p in node.depends_on]
     lines.append(
-        "Teach one reasoning step and keep it short. End the message with one check"
-        " question on the node you taught, then end your turn."
-        + ("" if node is not None else " Record the answer on that node first.")
+        "If the material is new to the user, teach with a worked example: walk through"
+        " one concrete instance, then state the general point. If they already hold its"
+        " foundations, explain briefly and make the check a small problem that needs it."
+    )
+    lines.append(
+        "Teach one reasoning step and keep it short. End with one check question on what"
+        " you taught, then end your turn."
     )
     return lines
 
 
-def _advance(conn, cycle, cfg, now, *, skip: bool) -> str:
+def _advance(conn, cycle, cfg, now, answer) -> str:
+    """Count ``answer`` (an evidence row, or None) and describe the next step."""
+
     if "asked" not in cycle:
         _new_cycle(cycle)
     phase = cycle.get("phase") or ""
     notes = [f"Config warning: {warning}" for warning in cfg["_warnings"]]
-
-    answer = None
-    if phase in QUESTION_PHASES:
-        if cycle.get("answer_evidence_id") is not None:
-            answer = conn.execute(
-                "SELECT * FROM evidence WHERE id = ?", (cycle["answer_evidence_id"],)
-            ).fetchone()
-        if answer is None and not skip:
-            target = cycle.get("node_id")
-            what = f"node {target}" if target is not None else "the node your question asked about"
-            return (
-                f"ERROR: the user's answer to the current {phase} step hasn't been recorded."
-                f" Call record_understanding on {what} first, or call next_study_step with"
-                " skip=true if the user wants to move on."
-            )
-
-    issued = _parse_time(cycle.get("issued_at") or "")
-    if issued is not None:
-        minutes = (now - issued).total_seconds() / 60.0
-        if minutes >= cfg["cycle"]["recap_after_minutes"]:
-            notes.append(
-                f"It has been {minutes:.0f} minutes since the last step. Open with a"
-                " one-line reminder of where you were."
-            )
 
     states = node_states(conn, now, cfg)
     accuracy = _accuracy(conn, cfg, now)
@@ -1259,84 +1148,35 @@ def _advance(conn, cycle, cfg, now, *, skip: bool) -> str:
     if answer is not None and want != "teach":
         verdict = "correct" if answer["understands"] else "incorrect"
         notes.append(
-            f"The user's last answer was recorded as {verdict}. Open with a sentence or"
-            " two of feedback, and say what is true if they missed it."
+            f"The user's answer was recorded as {verdict}. Open with a sentence or two of"
+            " feedback, and say what is true if they missed it."
         )
 
     if want == "new":
         _new_cycle(cycle)
         want = "review"
     if want == "review":
-        node = None
+        due = []
         if cycle["reviews_done"] < cfg["cycle"]["review_questions"]:
-            node = _pick_review(states, cycle, cfg)
+            due = _due(states, cycle, cfg)
         lines = (
-            _review_step(cycle, node, cfg, now, accuracy)
-            if node is not None
-            else _probe_step(conn, cycle, states, cfg, now, accuracy)
+            _review_step(cycle, due, cfg, now, accuracy)
+            if due
+            else _probe_step(conn, cycle, states, cfg, accuracy)
         )
     elif want == "probe":
-        lines = _probe_step(conn, cycle, states, cfg, now, accuracy)
+        lines = _probe_step(conn, cycle, states, cfg, accuracy)
     else:
-        lines = _teach_step(cycle, states, now, teach)
+        lines = _teach_step(cycle, states, teach)
     return "\n".join(notes + lines)
 
 
-@_learning_tool(study=True, writes={CYCLE}, init={CYCLE: dict})
-def next_study_step(skip: bool = False, state=None) -> str:
-    """Get the next step of the study session: what to do, and which node.
-
-    Call this after recording evidence for the user's last answer, and do
-    exactly what the step says. The plugin decides when to review, probe,
-    and teach, so you never need to plan the session yourself.
-
-    Args:
-        skip: True if the user wants to move on without answering the
-            current question.
-    """
-
-    if state is None:
-        return "ERROR: next_study_step needs session state."
-    cfg = load_config()
-    cycle = _cycle(state)
-    return _run(lambda conn: _advance(conn, cycle, cfg, _now(), skip=bool(skip)))
-
-
-@_learning_tool(study=True, writes={CYCLE}, init={CYCLE: dict})
-def set_study_focus(node_id: int | None = None, state=None) -> str:
-    """Focus the study session on a node and the nodes near it in the graph.
-
-    Call this when the user names something they want to study, after
-    finding or adding a node for it. Omit node_id to clear the focus.
-
-    Args:
-        node_id: The node to focus on.
-    """
-
-    if state is None:
-        return "ERROR: set_study_focus needs session state."
-    cycle = _cycle(state)
-    if node_id is None:
-        cycle["focus_node_id"] = None
-        return "Focus cleared."
-    if _run(lambda conn: _missing_nodes(conn, (node_id,))):
-        return f"ERROR: no node with id {node_id}."
-    _new_cycle(cycle)
-    cycle["focus_node_id"] = node_id
-    cycle["phase"] = "focus"
-    return f"Focus set to node {node_id}. Call next_study_step for the first question."
-
-
 STUDY_TOOLS = (
-    next_study_step,
-    set_study_focus,
     record_understanding,
+    view_knowledge,
     search_knowledge,
     add_knowledge,
     add_dependency,
-    view_knowledge,
-    find_study_targets,
-    list_observations,
     attach_observation,
     dismiss_observation,
 )
@@ -1350,23 +1190,25 @@ STUDY_PROMPT = """
 
 # Study session
 This is a study session. The user studies here in the gaps while their other
-agents work, so they may leave and come back at any moment. The plugin runs
-the session: it decides when to review, probe, and teach, and which node to
-work on. You carry out one step at a time and build the knowledge graph as you
-go. The user should never have to organize their own studying.
+agents work, so they may leave and come back at any moment. They should never
+have to organize their own studying: the plugin keeps the rhythm of review,
+probing, and teaching, and you decide what to ask and teach by reading the
+knowledge graph and reacting to what the user shows you.
 
 ## Each turn
-1. If the user just answered a question, call record_understanding for every
-   node the answer bears on. If the step named a node, record evidence on that
-   node; if it didn't, record the node your question asked about first.
-2. Call next_study_step and do exactly what it says.
-3. Ask at most one question per message, then end your turn.
+After the user answers, call record_understanding for every node the answer
+bears on, starting with the node your question asked about. The first record
+for each answer returns the next step: whether to review, probe, or teach,
+with the graph context behind it. Follow the step, but choose its content
+yourself. Read the candidate nodes, follow their dependencies with
+view_knowledge, search for related nodes, and anchor your choice in what the
+graph holds and what the user's answers revealed. Ask at most one question per
+message, then end your turn.
 
-If the user asks you something or wants to discuss a point, answer them and
-leave the current step open; call next_study_step only after they answer its
-question. If they want to skip a question, call next_study_step with
-skip=true. If they name something they want to study, find or add a node for
-it and call set_study_focus.
+If the user asks something or wants to discuss a point, answer them; the step
+waits for their next answer. If they name something they want to study, find
+or add a node for it and ask about it. If they don't know an answer, that is
+evidence of a gap.
 
 ## Grading
 Decide the correct answer before you ask, and grade strictly against it. The
@@ -1374,24 +1216,40 @@ user answers by thinking out loud; read all of it. Their reasoning often shows
 understanding or misunderstanding of nodes besides the one you asked about,
 and their confidence shows in how they phrase it. A right answer reached
 through confused reasoning is evidence against the reasoning's premises.
-"I don't know" is a gap, not a wrong answer.
 
 ## The graph
 Each node is one true, specific, self-contained statement, worded objectively
-rather than about the user. A misconception enters the graph as the correct
+rather than about the user. Nodes hold knowledge about the wider world: how a
+technology, algorithm, model, mathematical idea, or scientific concept works.
+Never add nodes about the code, files, or project details on the user's
+machine. A misconception enters the graph as the correct
 statement, and the user's wrong belief is recorded as evidence that they don't
 understand it. A node depends on another when understanding it requires
 understanding the other. Before adding a node, call search_knowledge and reuse
 an existing node that states the same idea in other words. Add dependency links
 whenever you see them.
 
+Evidence summaries show how many records a node has, when the last was, and a
+net score that is positive when recent evidence says the user understands it.
+A possible hole is a node that well-understood nodes rest on but whose own
+evidence is thin, old, or negative. A possible edge is a node the user failed
+or hasn't been tested on whose foundations look solid.
+
 ## Grounding
 Observations and evidence point to a project, session, and entry index. When
 one points at the user's own work, read that part of the transcript with the
-trace tools if they are available, and ask about the user's actual code or
-problem rather than a textbook example.
+trace tools if they are available, and use the user's actual code or problem
+as the setting for a question rather than a textbook example. The question
+still tests the general knowledge, not the local code. If an observation is
+about local details rather than knowledge of the world, dismiss it.
 
-Keep every message short, because the user reads it between other tasks.
+## Presentation
+The user's terminal renders Markdown, LaTeX, and Mermaid. Write inline math as
+$...$ and display math as $$...$$ on lines of its own. Draw diagrams in
+```mermaid code blocks. Use these where they make an explanation or question
+clearer: equations for anything mathematical, and diagrams for structure,
+flows, or how ideas depend on each other. Keep every message short, because
+the user reads it between other tasks.
 """.rstrip()
 
 
@@ -1436,15 +1294,48 @@ class StudyPromptInstructions(RenderTransformRegistrar):
 # Commands
 # ---------------------------------------------------------------------------
 
+STUDY_START_MESSAGE = (
+    "[Harness]: The user ran /study to start a study session. The study tools"
+    " are now available. Follow the study-session instructions, starting with"
+    " this step:\n\n"
+)
+
+
+def _publish_learning_tools(state) -> None:
+    # Commands do not run the pipeline, and tools publish their availability
+    # only when it runs. Republish now so the next model request offers the
+    # tools for the new mode, not the ones from before the toggle.
+    if getattr(state, "tool_schemas", None) is None:
+        return
+    for tool in (characterize_user_understanding, *STUDY_TOOLS):
+        tool._publish(state)
+
+
 def _study_on(ctx):
+    if getattr(ctx.state, STUDY_FLAG, False):
+        return CommandResult.notice("Study session is already on.")
     setattr(ctx.state, STUDY_FLAG, True)
-    return CommandResult.notice(
-        "Study session on. Say anything to start, or name a topic to study."
-    )
+    _publish_learning_tools(ctx.state)
+
+    cycle = _cycle(ctx.state)
+    _new_cycle(cycle)
+    cycle["phase"] = ""
+    # Messages from before /study are not answers to the first step.
+    cycle["answered_entry"] = _latest_user_entry_index(ctx.state)
+    cfg = load_config()
+    step = _run(lambda conn: _advance(conn, cycle, cfg, _now(), None))
+
+    # Interrupt delivery waits for a valid slot after any unanswered user
+    # message, then starts the agent's turn.
+    pending = list(getattr(ctx.state, "pending_interrupts", None) or [])
+    pending.append(STUDY_START_MESSAGE + step)
+    ctx.state.pending_interrupts = pending
+    return CommandResult.notice("Study session on.")
 
 
 def _study_off(ctx):
     setattr(ctx.state, STUDY_FLAG, False)
+    _publish_learning_tools(ctx.state)
     return CommandResult.notice("Study session off.")
 
 

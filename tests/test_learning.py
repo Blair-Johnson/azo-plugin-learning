@@ -182,6 +182,62 @@ def test_study_instructions_render_only_during_study():
     assert session.state.entries[0].messages[0]["content"] == "Base system"
 
 
+def test_study_command_parses_an_optional_message():
+    from agent_zoo.runtime.commands import CommandRegistry
+
+    session = _build_session()
+    commands = [c for c in session.pipeline if type(c).__name__ == "Command"]
+    registry = CommandRegistry(commands)
+
+    with_message = registry.parse("/study I'd like to continue learning about OFDM")
+    assert with_message.command.path == "/study"
+    assert with_message.arguments == {"message": "I'd like to continue learning about OFDM"}
+    assert registry.parse("/study").arguments == {"message": ""}
+    assert registry.parse("/study off").command.path == "/study off"
+
+
+def test_study_message_follows_the_harness_message_and_is_not_an_answer():
+    session = Session(system_prompt="Base system")
+    builder = PipelineBuilder(session).add(core()).add(interrupts())
+    plugin.register_features(builder, session=session, config=SimpleNamespace())
+    session.pipeline = builder.build()
+    session.run()
+    node = _add("OFDM subcarriers are spaced 1/T apart, which makes them orthogonal.")
+
+    plugin._study_on(
+        SimpleNamespace(state=session.state, session=session),
+        message="I'd like to continue learning about OFDM",
+    )
+
+    harness, user = session.state.entries[-2:]
+    assert harness.system_generated and "ran /study" in harness.messages[0]["content"]
+    assert "message below says what they want to study" in harness.messages[0]["content"]
+    assert "Possible holes" not in harness.messages[0]["content"]
+    assert not user.system_generated
+    assert user.messages[0]["content"] == (
+        "--- USER ---\nI'd like to continue learning about OFDM\n--- END USER ---"
+    )
+    assert session.state.pending_interrupts == []
+    assert session.needs_reply
+    assert "record_understanding" in {s["function"]["name"] for s in session.tool_schemas}
+
+    # Evidence drawn from the /study message itself is not graded as an answer.
+    assert _record(session.state, node, True) == "Recorded."
+    session.state.entries.append(_entry(len(session.state.entries), "user", "answer"))
+    assert _record(session.state, node, False).startswith("Recorded. Next:\nStep: teach")
+
+
+def test_study_message_while_already_studying_is_sent_as_a_user_message():
+    session = _build_session()
+    ctx = SimpleNamespace(state=session.state, session=session)
+    setattr(session.state, plugin.STUDY_FLAG, True)
+
+    result = plugin._study_on(ctx, message="switch to OFDM")
+
+    assert "sent your message" in result.outputs[0].text
+    assert session.state.entries[-1].messages[0]["content"].count("switch to OFDM") == 1
+
+
 def test_prompts_scope_knowledge_to_the_wider_world_and_mention_rendering():
     observe = plugin.characterize_user_understanding.schema["function"]["description"]
 

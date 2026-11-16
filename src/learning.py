@@ -39,7 +39,7 @@ from agent_utils.components import (
 from agent_utils.tool import Tool
 from agent_utils.types import MODEL_RENDER_CHANNEL
 from agent_zoo.projects import resolve_state_root
-from agent_zoo.runtime.commands import Command, CommandResult
+from agent_zoo.runtime.commands import Arg, Command, CommandResult
 
 _PLUGIN_NAME = "azo-plugin-learning"
 STUDY_FLAG = "learning_study_active"
@@ -1171,6 +1171,24 @@ def _advance(conn, cycle, cfg, now, answer) -> str:
     return "\n".join(notes + lines)
 
 
+def _directed_step(conn, cycle, cfg, now) -> str:
+    """The first step when the user's /study message says what to study."""
+
+    accuracy = _accuracy(conn, cfg, now)
+    _issue(cycle, "probe", None)
+    return "\n".join([
+        *(f"Config warning: {warning}" for warning in cfg["_warnings"]),
+        f"Step: probe (question 1 of up to {_probe_limit(cfg, accuracy)} before teaching)",
+        "The user's message below says what they want to study. Find it in the graph"
+        " with search_knowledge and read what is there and around it with"
+        " view_knowledge, including the evidence of what they already understand. Add"
+        " a node for it if the graph has none. Then ask one question that finds where"
+        " their understanding of it runs out.",
+        _accuracy_line(accuracy, cfg),
+        "Decide the correct answer before asking. " + _FINISH_QUESTION,
+    ])
+
+
 STUDY_TOOLS = (
     record_understanding,
     view_knowledge,
@@ -1311,8 +1329,17 @@ def _publish_learning_tools(state) -> None:
         tool._publish(state)
 
 
-def _study_on(ctx):
+def _user_message(text: str) -> str:
+    # Matches how the runtime frames typed user input.
+    return f"--- USER ---\n{text}\n--- END USER ---"
+
+
+def _study_on(ctx, message: str = ""):
+    message = str(message or "").strip()
     if getattr(ctx.state, STUDY_FLAG, False):
+        if message:
+            ctx.session.inject(_user_message(message))
+            return CommandResult.notice("Study session is already on; sent your message.")
         return CommandResult.notice("Study session is already on.")
     setattr(ctx.state, STUDY_FLAG, True)
     _publish_learning_tools(ctx.state)
@@ -1320,16 +1347,22 @@ def _study_on(ctx):
     cycle = _cycle(ctx.state)
     _new_cycle(cycle)
     cycle["phase"] = ""
-    # Messages from before /study are not answers to the first step.
-    cycle["answered_entry"] = _latest_user_entry_index(ctx.state)
     cfg = load_config()
-    step = _run(lambda conn: _advance(conn, cycle, cfg, _now(), None))
-
-    # Interrupt delivery waits for a valid slot after any unanswered user
-    # message, then starts the agent's turn.
-    pending = list(getattr(ctx.state, "pending_interrupts", None) or [])
-    pending.append(STUDY_START_MESSAGE + step)
-    ctx.state.pending_interrupts = pending
+    if message:
+        step = _run(lambda conn: _directed_step(conn, cycle, cfg, _now()))
+        # Queued interrupts are held until after a pending user message is
+        # answered, so inject both entries directly to keep them in order.
+        ctx.session.inject(STUDY_START_MESSAGE + step, system_generated=True)
+        ctx.session.inject(_user_message(message))
+    else:
+        step = _run(lambda conn: _advance(conn, cycle, cfg, _now(), None))
+        # Interrupt delivery waits for a valid slot after any unanswered user
+        # message, then starts the agent's turn.
+        pending = list(getattr(ctx.state, "pending_interrupts", None) or [])
+        pending.append(STUDY_START_MESSAGE + step)
+        ctx.state.pending_interrupts = pending
+    # Messages up to now, including the /study message, are not answers.
+    cycle["answered_entry"] = _latest_user_entry_index(ctx.state)
     return CommandResult.notice("Study session on.")
 
 
@@ -1354,6 +1387,8 @@ def register_features(builder, *, session, config):
         components=[
             Command(
                 "/study", "Turn this session into a study session", _study_on,
+                args=(Arg("message", kind="text", default=""),),
+                usage="/study [what you'd like to study]",
                 init={STUDY_FLAG: bool}, section="Learning",
             ),
             Command(

@@ -1,0 +1,44 @@
+# azo-plugin-learning settings. Edits apply on the next tool call; no reload
+# is needed. Omitted settings use the defaults shown here.
+
+cycle:
+  # Review questions at the start of each cycle, when nodes are due.
+  review_questions: 2
+  # Probe questions before teaching, if the user doesn't miss first.
+  probe_questions: 3
+  # Times a node is taught before moving on and leaving it to review.
+  max_teach_attempts: 2
+  # How far from the focus node probing may wander, in dependency links.
+  focus_hops: 2
+  # A gap this long since the last step earns a one-line recap.
+  recap_after_minutes: 20
+
+accuracy:
+  # Recent graded answers used to judge whether questions are too hard.
+  window_answers: 10
+  window_hours: 12
+  min_answers: 4
+  # Below low: one probe per cycle and easier targets. Above high: harder.
+  low: 0.75
+  high: 0.90
+
+review:
+  # Review interval after a miss or a first success.
+  base_interval_days: 1.0
+  # Each further spaced success multiplies the interval by this.
+  growth_factor: 3.0
+  # Successes closer together than this count as one.
+  min_success_gap_hours: 8.0
+  # A node is due once time since its last evidence reaches this multiple
+  # of its interval. Due nodes are ranked, never queued.
+  due_ratio: 1.0
+  # Extra review priority per node that depends on this one.
+  dependent_weight: 0.25
+
+scoring:
+  # Evidence weight halves over this many days, for hole and edge scores.
+  half_life_days: 30.0
+  # Weight of a passive observation relative to a study answer.
+  observation_weight: 0.4
+  # How much neighbours' evidence counts toward a node's scores.
+  neighbour_weight: 0.5

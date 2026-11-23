@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agent_utils import PipelineBuilder, Session, core, interrupts
-from agent_utils.types import Entry
+from agent_utils.core.events import InputReceived, RenderRequested
+from agent_utils.core.pipeline import PipelineBuilder
+from agent_utils.core.session import Session
+from agent_utils.core.state import Entry, State
+from agent_utils.features.core import core_feature
+from agent_utils.features.interrupts import interrupts_feature
+from agent_zoo.events import SlashCommand
+from agent_zoo.features.commands import Command, CommandRegistry, commands_feature
+from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry
+from agent_zoo.pipelines.default import build_default_builder
 
 import src.learning as plugin
 
@@ -37,27 +46,30 @@ def _entry(index, role, content, *, system_generated=False):
 
 
 def _session_state(tmp_path, *entries, study=False):
-    state = SimpleNamespace(
-        run_db=SimpleNamespace(
-            session_id="session-1",
-            agent_db=SimpleNamespace(path=str(tmp_path / "projects" / "demo" / "db.sqlite")),
-        ),
-        entries=list(entries),
+    state = State()
+    state.entries = list(entries)
+    state.run_db = SimpleNamespace(
+        session_id="session-1",
+        agent_db=SimpleNamespace(path=str(tmp_path / "projects" / "demo" / "db.sqlite")),
     )
     setattr(state, plugin.STUDY_FLAG, study)
     return state
 
 
-def _build_session():
+def _build_session(*, with_interrupts=False, with_commands=False):
     session = Session(system_prompt="Base system")
-    builder = PipelineBuilder(session).add(core())
-    plugin.register_features(builder, session=session, config=SimpleNamespace())
+    builder = PipelineBuilder().add(core_feature())
+    if with_interrupts:
+        builder.add(interrupts_feature())
+    if with_commands:
+        builder.add(commands_feature())
+    plugin.register_features(builder, session=session, config={})
     session.pipeline = builder.build()
     return session
 
 
 def _add(statement, depends_on=None):
-    result = plugin.add_knowledge.fn(statement=statement, depends_on=depends_on)
+    result = plugin.add_knowledge.call(None, statement=statement, depends_on=depends_on)
     assert result.startswith("Added node "), result
     return int(result.removeprefix("Added node ").rstrip("."))
 
@@ -93,16 +105,17 @@ def _write_config(tmp_path, text):
 def _start():
     """Run /study on a bare session state and return (state, first step)."""
 
-    state = SimpleNamespace(entries=[_entry(0, "system", "sys")], pending_interrupts=[])
-    plugin._study_on(SimpleNamespace(state=state, session=None))
+    state = State(entries=[_entry(0, "system", "sys")])
+    state.pending_interrupts = []
+    plugin._study_on(SimpleNamespace(state=state))
     message = state.pending_interrupts[-1]
     assert message.startswith(plugin.STUDY_START_MESSAGE)
     return state, message.removeprefix(plugin.STUDY_START_MESSAGE)
 
 
 def _record(state, node, understands):
-    return plugin.record_understanding.fn(
-        node_id=node, understands=understands, evidence="answer", state=state
+    return plugin.record_understanding.call(
+        state, node_id=node, understands=understands, evidence="answer"
     )
 
 
@@ -123,9 +136,46 @@ def test_pipeline_builds_with_all_tools():
         assert study_tool in session.pipeline
 
 
+def test_composes_onto_default_agent_zoo_builder():
+    session = Session(system_prompt="Base system")
+    builder = build_default_builder(
+        session, config={}, include_plugins=False, include_llm_drivers=False
+    )
+    plugin.register_features(builder, session=session, config={})
+    session.pipeline = builder.build()
+    session.render()
+
+    names = {schema["function"]["name"] for schema in session.tool_schemas}
+    assert "characterize_user_understanding" in names
+    assert "record_understanding" not in names
+
+
+def test_tool_dispatches_via_event_pipeline():
+    session = _build_session()
+    session.render()
+    call = {
+        "id": "call-1",
+        "type": "function",
+        "function": {
+            "name": "characterize_user_understanding",
+            "arguments": json.dumps({
+                "topic": "how WAL mode allows concurrent SQLite readers",
+                "evidence": "explained WAL readers don't block writers",
+                "understands": True,
+            }),
+        },
+    }
+    session.step(InputReceived(message={"role": "assistant", "content": "", "tool_calls": [call]}))
+
+    assert session.state.last_tool_calls[0].result == "Recorded."
+    assert not session.state.last_tool_calls[0].error
+    assert len(_rows("observations")) == 1
+
+
 @pytest.mark.parametrize("study", [False, True])
 def test_study_flag_selects_the_visible_tools(study):
-    state = SimpleNamespace(**{plugin.STUDY_FLAG: study})
+    state = State()
+    setattr(state, plugin.STUDY_FLAG, study)
 
     assert plugin.characterize_user_understanding.available(state) is (not study)
     for study_tool in plugin.STUDY_TOOLS:
@@ -133,17 +183,13 @@ def test_study_flag_selects_the_visible_tools(study):
 
 
 def test_study_tools_are_hidden_without_the_flag():
-    assert not plugin.search_knowledge.available(SimpleNamespace())
-    assert plugin.characterize_user_understanding.available(SimpleNamespace())
+    assert not plugin.search_knowledge.available(State())
+    assert plugin.characterize_user_understanding.available(State())
 
 
 def test_study_command_wakes_the_agent_with_study_tools_and_a_first_step():
-    session = Session(system_prompt="Base system")
-    builder = PipelineBuilder(session).add(core()).add(interrupts())
-    plugin.register_features(builder, session=session, config=SimpleNamespace())
-    session.pipeline = builder.build()
-    session.run()
-    ctx = SimpleNamespace(state=session.state, session=session)
+    session = _build_session(with_interrupts=True, with_commands=True)
+    session.render()
 
     def tool_names():
         return {schema["function"]["name"] for schema in session.tool_schemas}
@@ -152,11 +198,8 @@ def test_study_command_wakes_the_agent_with_study_tools_and_a_first_step():
     assert "record_understanding" not in tool_names()
     assert not session.needs_reply
 
-    plugin._study_on(ctx)
+    session.step(SlashCommand("/study"))
 
-    # The idle runtime delivers interrupts without a full pipeline pass, so the
-    # command itself must have refreshed the published tools.
-    assert session.poll_interrupts()
     assert "record_understanding" in tool_names()
     assert "characterize_user_understanding" not in tool_names()
     content = session.state.entries[-1].messages[0]["content"]
@@ -165,10 +208,11 @@ def test_study_command_wakes_the_agent_with_study_tools_and_a_first_step():
     assert session.needs_reply
     assert "# Study session" in session.messages[0]["content"]
 
-    assert "already on" in plugin._study_on(ctx).outputs[0].text
+    already = plugin._study_on(SimpleNamespace(state=session.state))
+    assert "already on" in already.outputs[0].text
     assert session.state.pending_interrupts == []
 
-    plugin._study_off(ctx)
+    session.step(SlashCommand("/study off"))
     assert getattr(session.state, plugin.STUDY_FLAG) is False
     assert "record_understanding" not in tool_names()
     assert "characterize_user_understanding" in tool_names()
@@ -177,17 +221,15 @@ def test_study_command_wakes_the_agent_with_study_tools_and_a_first_step():
 def test_study_instructions_render_only_during_study():
     session = _build_session()
 
-    assert session.rerender()[0]["content"] == "Base system"
+    assert session.render()[0]["content"] == "Base system"
     setattr(session.state, plugin.STUDY_FLAG, True)
-    assert session.rerender()[0]["content"] == "Base system" + plugin.STUDY_PROMPT
+    assert session.render()[0]["content"] == "Base system" + plugin.STUDY_PROMPT
     assert session.state.entries[0].messages[0]["content"] == "Base system"
 
 
 def test_study_command_parses_an_optional_message():
-    from agent_zoo.runtime.commands import CommandRegistry
-
     session = _build_session()
-    commands = [c for c in session.pipeline if type(c).__name__ == "Command"]
+    commands = [c for c in session.pipeline if isinstance(c, Command)]
     registry = CommandRegistry(commands)
 
     with_message = registry.parse("/study I'd like to continue learning about OFDM")
@@ -198,17 +240,11 @@ def test_study_command_parses_an_optional_message():
 
 
 def test_study_message_follows_the_harness_message_and_is_not_an_answer():
-    session = Session(system_prompt="Base system")
-    builder = PipelineBuilder(session).add(core()).add(interrupts())
-    plugin.register_features(builder, session=session, config=SimpleNamespace())
-    session.pipeline = builder.build()
-    session.run()
+    session = _build_session(with_interrupts=True, with_commands=True)
+    session.render()
     node = _add("OFDM subcarriers are spaced 1/T apart, which makes them orthogonal.")
 
-    plugin._study_on(
-        SimpleNamespace(state=session.state, session=session),
-        message="I'd like to continue learning about OFDM",
-    )
+    session.step(SlashCommand("/study I'd like to continue learning about OFDM"))
 
     harness, user = session.state.entries[-2:]
     assert harness.system_generated and "ran /study" in harness.messages[0]["content"]
@@ -229,11 +265,10 @@ def test_study_message_follows_the_harness_message_and_is_not_an_answer():
 
 
 def test_study_message_while_already_studying_is_sent_as_a_user_message():
-    session = _build_session()
-    ctx = SimpleNamespace(state=session.state, session=session)
+    session = _build_session(with_commands=True)
     setattr(session.state, plugin.STUDY_FLAG, True)
 
-    result = plugin._study_on(ctx, message="switch to OFDM")
+    result = plugin._study_on(SimpleNamespace(state=session.state), message="switch to OFDM")
 
     assert "sent your message" in result.outputs[0].text
     assert session.state.entries[-1].messages[0]["content"].count("switch to OFDM") == 1
@@ -273,7 +308,6 @@ def test_config_file_overrides_and_reports_bad_values(tmp_path):
 
 def test_shipped_config_matches_defaults():
     import yaml
-    from pathlib import Path
 
     shipped = yaml.safe_load((Path(__file__).parent.parent / "config" / "learning.yaml").read_text())
 
@@ -304,12 +338,10 @@ def test_connect_migrates_evidence_table_without_question_phase():
 
 
 def _settings():
-    from agent_zoo.runtime.settings import Setting, SettingsContext, SettingsRegistry
-
     session = _build_session()
     registry = SettingsRegistry([c for c in session.pipeline if isinstance(c, Setting)])
     assert registry.error is None
-    ctx = SettingsContext(session)
+    ctx = SettingsContext(state=session.state, emit=lambda _ev: None)
 
     def catalog():
         return {row["key"]: row for row in registry.catalog(ctx)}
@@ -423,11 +455,11 @@ def test_records_observation_with_pointer_to_latest_user_entry(tmp_path):
         _entry(3, "user", "[interrupt]", system_generated=True),
     )
 
-    result = plugin.characterize_user_understanding.fn(
+    result = plugin.characterize_user_understanding.call(
+        state,
         topic="why the GIL stops CPU-bound Python threads from running in parallel",
         evidence="Expected threading to speed up a CPU-bound loop.",
         understands=False,
-        state=state,
     )
 
     assert result == "Recorded."
@@ -437,8 +469,8 @@ def test_records_observation_with_pointer_to_latest_user_entry(tmp_path):
 
 
 def test_records_observation_without_session_state():
-    result = plugin.characterize_user_understanding.fn(
-        topic="topic", evidence="evidence", understands=True
+    result = plugin.characterize_user_understanding.call(
+        None, topic="topic", evidence="evidence", understands=True
     )
 
     assert result == "Recorded."
@@ -455,7 +487,7 @@ def test_records_observation_without_session_state():
     ],
 )
 def test_rejects_invalid_observations(kwargs, message):
-    result = plugin.characterize_user_understanding.fn(**kwargs)
+    result = plugin.characterize_user_understanding.call(None, **kwargs)
 
     assert result.startswith("ERROR") and message in result
     assert _rows("observations") == []
@@ -463,14 +495,14 @@ def test_rejects_invalid_observations(kwargs, message):
 
 def test_observation_attach_and_dismiss():
     for topic, understands in (("lifetimes", False), ("borrowing", True), ("macros", False)):
-        plugin.characterize_user_understanding.fn(
-            topic=topic, evidence=f"said something about {topic}", understands=understands
+        plugin.characterize_user_understanding.call(
+            None, topic=topic, evidence=f"said something about {topic}", understands=understands
         )
     node = _add("A reference cannot outlive the value it borrows.")
 
-    assert plugin.attach_observation.fn(observation_id=1, node_id=node).startswith("Attached")
-    assert "already attached" in plugin.attach_observation.fn(observation_id=1, node_id=node)
-    assert plugin.dismiss_observation.fn(observation_id=3).startswith("Dismissed")
+    assert plugin.attach_observation.call(None, observation_id=1, node_id=node).startswith("Attached")
+    assert "already attached" in plugin.attach_observation.call(None, observation_id=1, node_id=node)
+    assert plugin.dismiss_observation.call(None, observation_id=3).startswith("Dismissed")
 
     _, step = _start()
     assert "observation 2" in step
@@ -492,12 +524,12 @@ def test_add_search_and_view_knowledge(tmp_path):
     state = _session_state(tmp_path, _entry(0, "user", "threads share one GIL, right?"), study=True)
 
     assert _record(state, top, True).startswith("Recorded.")
-    found = plugin.search_knowledge.fn(query="threads in parallel")
+    found = plugin.search_knowledge.call(None, query="threads in parallel")
     assert f"node {top}:" in found
-    view = plugin.view_knowledge.fn(node_id=base)
+    view = plugin.view_knowledge.call(None, node_id=base)
     assert "Depended on by:" in view and f"node {top}:" in view
     assert "possible hole" in view
-    view = plugin.view_knowledge.fn(node_id=top)
+    view = plugin.view_knowledge.call(None, node_id=top)
     assert "understands (study; project demo, session session-1, entry 0" in view
     assert "review interval 1 days" in view
 
@@ -506,14 +538,14 @@ def test_graph_edits_validate_ids_and_cycles():
     a = _add("A")
     b = _add("B", depends_on=[a])
 
-    assert plugin.add_knowledge.fn(statement="C", depends_on=[99]).startswith("ERROR")
-    assert plugin.add_dependency.fn(node_id=a, depends_on_id=a).startswith("ERROR")
-    assert "cycle" in plugin.add_dependency.fn(node_id=a, depends_on_id=b)
-    assert plugin.record_understanding.fn(node_id=99, understands=True, evidence="e").startswith(
+    assert plugin.add_knowledge.call(None, statement="C", depends_on=[99]).startswith("ERROR")
+    assert plugin.add_dependency.call(None, node_id=a, depends_on_id=a).startswith("ERROR")
+    assert "cycle" in plugin.add_dependency.call(None, node_id=a, depends_on_id=b)
+    assert plugin.record_understanding.call(None, node_id=99, understands=True, evidence="e").startswith(
         "ERROR"
     )
     c = _add("C")
-    assert plugin.add_dependency.fn(node_id=c, depends_on_id=b).startswith("Node")
+    assert plugin.add_dependency.call(None, node_id=c, depends_on_id=b).startswith("Node")
     assert _states()[b].dependents == (c,)
 
 
@@ -625,11 +657,9 @@ def test_only_the_first_record_for_each_user_message_advances_the_cycle():
 
 def test_messages_from_before_study_are_not_answers():
     node = _add("node")
-    state = SimpleNamespace(
-        entries=[_entry(0, "system", "sys"), _entry(1, "user", "earlier chat")],
-        pending_interrupts=[],
-    )
-    plugin._study_on(SimpleNamespace(state=state, session=None))
+    state = State(entries=[_entry(0, "system", "sys"), _entry(1, "user", "earlier chat")])
+    state.pending_interrupts = []
+    plugin._study_on(SimpleNamespace(state=state))
 
     assert _record(state, node, True) == "Recorded."
     assert _answer(state, node, True).startswith("Recorded. Next:")
@@ -637,7 +667,7 @@ def test_messages_from_before_study_are_not_answers():
 
 def test_records_outside_study_never_advance():
     node = _add("node")
-    state = SimpleNamespace(entries=[_entry(0, "user", "hi")])
+    state = State(entries=[_entry(0, "user", "hi")])
 
     assert _record(state, node, True) == "Recorded."
 
@@ -736,8 +766,8 @@ def test_low_accuracy_limits_probing_to_one_question():
 
 
 def test_probe_offers_untested_observations():
-    plugin.characterize_user_understanding.fn(
-        topic="selective scan", evidence="asked what it was", understands=False
+    plugin.characterize_user_understanding.call(
+        None, topic="selective scan", evidence="asked what it was", understands=False
     )
 
     _, step = _start()

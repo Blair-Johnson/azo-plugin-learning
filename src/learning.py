@@ -31,17 +31,20 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from agent_utils import Feature
-from agent_utils.components import (
+from agent_utils.core.events import Event, RenderRequested
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import MODEL_RENDER_CHANNEL, Entry, State
+from agent_utils.core.tool import Tool
+from agent_utils.features.core import (
     ExcludeForgotten,
     MessageRenderer,
     RenderTransformRegistrar,
 )
-from agent_utils.tool import Tool
-from agent_utils.types import MODEL_RENDER_CHANNEL
-from agent_zoo.projects import resolve_state_root
-from agent_zoo.runtime.commands import Arg, Command, CommandResult
-from agent_zoo.runtime.settings import Setting, SettingError
+from agent_utils.features.interrupts import InterruptQueued
+from agent_zoo.events import BeforeLLM
+from agent_zoo.features.commands import Arg, Command, CommandContext, CommandResult
+from agent_zoo.features.settings import Setting, SettingError
+from agent_zoo.storage.projects import resolve_state_root
 
 _PLUGIN_NAME = "azo-plugin-learning"
 STUDY_FLAG = "learning_study_active"
@@ -427,12 +430,23 @@ def _current_session_id(state: Any) -> str:
     sid = str(getattr(run_db, "session_id", "") or "").strip()
     if sid:
         return sid
-    return str(getattr(state, "_session_id", "") or "").strip()
+    sid = str(getattr(state, "_session_id", "") or "").strip()
+    if sid:
+        return sid
+    context = getattr(state, "_agent_zoo_context", None)
+    if isinstance(context, dict):
+        return str(context.get("session_id") or "").strip()
+    return ""
 
 
 def _current_project(state: Any) -> str:
     for attr in ("_project_name", "project_name"):
         value = str(getattr(state, attr, "") or "").strip()
+        if value:
+            return value
+    context = getattr(state, "_agent_zoo_context", None)
+    if isinstance(context, dict):
+        value = str(context.get("project_name") or "").strip()
         if value:
             return value
     run_db = getattr(state, "run_db", None)
@@ -627,27 +641,25 @@ def _describe_review(state: NodeState, now: datetime) -> str:
 # Tools
 # ---------------------------------------------------------------------------
 
+_STATE_READS = {
+    "entries",
+    "_session_id",
+    "_agent_zoo_context",
+    "run_db",
+    "_project_name",
+    STUDY_FLAG,
+    CYCLE,
+}
+
+
 class LearningTool(Tool):
     """A tool shown only inside, or only outside, study sessions."""
 
-    def __init__(self, fn, *, study: bool, **kwargs):
-        super().__init__(fn, **kwargs)
-        self.study = study
+    study: bool = True
+    optional_reads: set[str] = set(_STATE_READS)
 
-    def available(self, state) -> bool:
+    def available(self, state: State) -> bool:
         return bool(getattr(state, STUDY_FLAG, False)) == self.study
-
-
-_STATE_READS = {"entries", "_session_id", "run_db", "_project_name", STUDY_FLAG, CYCLE}
-
-
-def _learning_tool(*, study: bool, writes: set | None = None, init: dict | None = None):
-    def wrap(fn):
-        return LearningTool(
-            fn, study=study, optional_reads=set(_STATE_READS), writes=writes, init=init
-        )
-
-    return wrap
 
 
 def _require_text(**fields: str) -> tuple[dict[str, str], str | None]:
@@ -682,265 +694,315 @@ def _depends_transitively(conn: sqlite3.Connection, start: int, target: int) -> 
     return row is not None
 
 
-@_learning_tool(study=False)
-def characterize_user_understanding(
-    topic: str,
-    evidence: str,
-    understands: bool,
-    state=None,
-) -> str:
-    """Characterize whether the user understands something, with brief evidence.
+class CharacterizeUserUnderstanding(LearningTool):
+    name = "characterize_user_understanding"
+    study = False
 
-    Call this whenever the user reveals what they do or don't understand,
-    even if it has nothing to do with your current task. That includes asking
-    what something means, asking for an explanation, seeming unsure, saying
-    something incorrect, explaining a concept correctly without help, or
-    catching a mistake you made. It returns immediately and does not affect
-    your work; you do not need to mention it to the user.
+    def call(
+        self,
+        state: State | None,
+        topic: str,
+        evidence: str,
+        understands: bool,
+    ) -> str:
+        """Characterize whether the user understands something, with brief evidence.
 
-    Only record knowledge about the wider world that is worth the user
-    internalizing: how a technology, algorithm, model architecture, protocol,
-    mathematical idea, or scientific concept works. Do not record knowledge
-    of the code, files, configuration, or project details on this machine,
-    such as what a local function does or where a setting lives.
+        Call this whenever the user reveals what they do or don't understand,
+        even if it has nothing to do with your current task. That includes asking
+        what something means, asking for an explanation, seeming unsure, saying
+        something incorrect, explaining a concept correctly without help, or
+        catching a mistake you made. It returns immediately and does not affect
+        your work; you do not need to mention it to the user.
 
-    Args:
-        topic: A specific description of what the user does or doesn't
-            understand, as precise as the evidence allows. For example,
-            "why the GIL stops CPU-bound Python threads from running in
-            parallel, while I/O-bound threads still benefit", not "Python GIL".
-        evidence: What the user said or did that revealed knowledge or lack
-            thereof on the topic.
-        understands: True if the user understands the topic, False if not.
-    """
+        Only record knowledge about the wider world that is worth the user
+        internalizing: how a technology, algorithm, model architecture, protocol,
+        mathematical idea, or scientific concept works. Do not record knowledge
+        of the code, files, configuration, or project details on this machine,
+        such as what a local function does or where a setting lives.
 
-    fields, error = _require_text(topic=topic, evidence=evidence)
-    if error:
-        return error
-    if not isinstance(understands, bool):
-        return "ERROR: understands must be true or false."
+        Args:
+            topic: A specific description of what the user does or doesn't
+                understand, as precise as the evidence allows. For example,
+                "why the GIL stops CPU-bound Python threads from running in
+                parallel, while I/O-bound threads still benefit", not "Python GIL".
+            evidence: What the user said or did that revealed knowledge or lack
+                thereof on the topic.
+            understands: True if the user understands the topic, False if not.
+        """
 
-    row = (_timestamp(), fields["topic"], fields["evidence"], int(understands), *_pointer(state))
-    _run(lambda conn: conn.execute(
-        "INSERT INTO observations (created_at, topic, evidence, understands,"
-        " project, session_id, user_entry_index) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        row,
-    ))
-    return "Recorded."
+        fields, error = _require_text(topic=topic, evidence=evidence)
+        if error:
+            return error
+        if not isinstance(understands, bool):
+            return "ERROR: understands must be true or false."
 
-
-@_learning_tool(study=True)
-def search_knowledge(query: str, limit: int = 10, state=None) -> str:
-    """Search the user's knowledge graph for nodes matching a description.
-
-    Always search before adding a node, and reuse an existing node that
-    states the same idea in other words.
-
-    Args:
-        query: Words describing the idea to look for.
-        limit: Maximum number of nodes to return.
-    """
-
-    terms = re.findall(r"\w+", str(query or ""))
-    if not terms:
-        return "ERROR: query must contain words to search for."
-    match = " OR ".join('"' + term + '"' for term in terms)
-    limit = max(1, min(int(limit), 50))
-
-    def work(conn):
-        ids = [
-            row["rowid"]
-            for row in conn.execute(
-                "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?"
-                " ORDER BY bm25(nodes_fts) LIMIT ?",
-                (match, limit),
-            )
-        ]
-        states = node_states(conn)
-        return [states[node] for node in ids if node in states]
-
-    found = _run(work)
-    if not found:
-        return "No matching nodes."
-    return "\n".join(_describe(state) for state in found)
-
-
-@_learning_tool(study=True)
-def add_knowledge(statement: str, depends_on: list[int] | None = None, state=None) -> str:
-    """Add a node to the user's knowledge graph.
-
-    Search with search_knowledge first. A node is one true, specific,
-    self-contained statement about the wider world, worded objectively
-    rather than about the user, never about code or files on this machine. Record a misconception as the correct statement, then record
-    evidence that the user doesn't understand it.
-
-    Args:
-        statement: The true statement this node represents.
-        depends_on: IDs of existing nodes that must be understood before
-            this one can be.
-    """
-
-    fields, error = _require_text(statement=statement)
-    if error:
-        return error
-    prerequisites = sorted(set(depends_on or []))
-
-    def work(conn):
-        missing = _missing_nodes(conn, prerequisites)
-        if missing:
-            return None, f"ERROR: no node with id {', '.join(map(str, missing))}."
-        created = _timestamp()
-        node = conn.execute(
-            "INSERT INTO nodes (statement, created_at) VALUES (?, ?)",
-            (fields["statement"], created),
-        ).lastrowid
-        conn.execute(
-            "INSERT INTO nodes_fts (rowid, statement) VALUES (?, ?)",
-            (node, fields["statement"]),
-        )
-        conn.executemany(
-            "INSERT INTO dependencies (node_id, depends_on_id, created_at) VALUES (?, ?, ?)",
-            [(node, prerequisite, created) for prerequisite in prerequisites],
-        )
-        return node, None
-
-    node, error = _run(work)
-    return error or f"Added node {node}."
-
-
-@_learning_tool(study=True)
-def add_dependency(node_id: int, depends_on_id: int, state=None) -> str:
-    """Record that understanding one node requires understanding another.
-
-    Args:
-        node_id: The node that depends on the other.
-        depends_on_id: The node that must be understood first.
-    """
-
-    if node_id == depends_on_id:
-        return "ERROR: a node cannot depend on itself."
-
-    def work(conn):
-        missing = _missing_nodes(conn, (node_id, depends_on_id))
-        if missing:
-            return f"ERROR: no node with id {', '.join(map(str, missing))}."
-        if _depends_transitively(conn, depends_on_id, node_id):
-            return (
-                f"ERROR: node {depends_on_id} already depends on node {node_id}, "
-                "so this link would create a cycle."
-            )
-        conn.execute(
-            "INSERT OR IGNORE INTO dependencies (node_id, depends_on_id, created_at)"
-            " VALUES (?, ?, ?)",
-            (node_id, depends_on_id, _timestamp()),
-        )
-        return f"Node {node_id} now depends on node {depends_on_id}."
-
-    return _run(work)
-
-
-@_learning_tool(study=True, writes={CYCLE}, init={CYCLE: dict})
-def record_understanding(node_id: int, understands: bool, evidence: str, state=None) -> str:
-    """Record evidence of whether the user understands a node.
-
-    Call this after every answer, for each node the answer bears on. Record
-    the node your question asked about first: the first record for each
-    user message is graded as their answer, and its result tells you what to
-    do next. The harness records the time and a pointer to the user's latest
-    message.
-
-    Args:
-        node_id: The node the evidence is about.
-        understands: True if the user understands the node, False if not.
-        evidence: What the user said or did that revealed knowledge or lack
-            thereof on the node.
-    """
-
-    fields, error = _require_text(evidence=evidence)
-    if error:
-        return error
-    if not isinstance(understands, bool):
-        return "ERROR: understands must be true or false."
-
-    pointer = _pointer(state)
-    cycle = _cycle(state) if state is not None else None
-    # The first record for each user message is the answer that advances the
-    # cycle; later records on the same message are extra evidence.
-    answers = (
-        cycle is not None
-        and getattr(state, STUDY_FLAG, False)
-        and (pointer[2] is None or pointer[2] != cycle.get("answered_entry"))
-    )
-    phase = cycle.get("phase") if answers else None
-    row = (
-        node_id, int(understands), fields["evidence"], _timestamp(), *pointer,
-        phase if phase in QUESTION_PHASES else None,
-    )
-    cfg = load_config()
-
-    def work(conn):
-        if _missing_nodes(conn, (node_id,)):
-            return f"ERROR: no node with id {node_id}."
-        evidence_id = conn.execute(
-            "INSERT INTO evidence (node_id, understands, evidence, observed_at, source_kind,"
-            " project, session_id, user_entry_index, question_phase)"
-            " VALUES (?, ?, ?, ?, 'study', ?, ?, ?, ?)",
+        row = (_timestamp(), fields["topic"], fields["evidence"], int(understands), *_pointer(state))
+        _run(lambda conn: conn.execute(
+            "INSERT INTO observations (created_at, topic, evidence, understands,"
+            " project, session_id, user_entry_index) VALUES (?, ?, ?, ?, ?, ?, ?)",
             row,
-        ).lastrowid
-        if not answers:
-            return "Recorded."
-        cycle["answered_entry"] = pointer[2]
-        answer = conn.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
-        return "Recorded. Next:\n" + _advance(conn, cycle, cfg, _now(), answer)
-
-    return _run(work)
+        ))
+        return "Recorded."
 
 
-@_learning_tool(study=True)
-def view_knowledge(node_id: int, state=None) -> str:
-    """Show a node, its dependency links, and all evidence recorded against it.
+characterize_user_understanding = CharacterizeUserUnderstanding()
 
-    Args:
-        node_id: The node to show.
-    """
 
-    now = _now()
+class SearchKnowledge(LearningTool):
+    name = "search_knowledge"
+    study = True
 
-    def work(conn):
-        states = node_states(conn, now)
-        node = states.get(node_id)
-        if node is None:
-            return f"ERROR: no node with id {node_id}."
-        lines = [f"{_flag(node)}{_describe(node)}", _describe_review(node, now)]
-        lines.append("Depends on:")
-        lines += [
-            f"  {_flag(states[p])}{_describe(states[p])}" for p in node.depends_on
-        ] or ["  nothing"]
-        lines.append("Depended on by:")
-        lines += [
-            f"  {_flag(states[d])}{_describe(states[d])}" for d in node.dependents
-        ] or ["  nothing"]
-        lines.append("Evidence, newest first:")
-        rows = conn.execute(
-            "SELECT * FROM evidence WHERE node_id = ? ORDER BY observed_at DESC, id DESC",
-            (node_id,),
-        ).fetchall()
-        for row in rows:
-            verdict = "understands" if row["understands"] else "doesn't understand"
-            source = row["source_kind"]
-            if row["observation_id"] is not None:
-                source += f" {row['observation_id']}"
-            if row["question_phase"]:
-                source += f", {row['question_phase']} answer"
-            lines.append(
-                f"  {row['observed_at'][:16]} {verdict} ({source}; {_format_pointer(row)}): "
-                f"{row['evidence']}"
+    def call(self, state: State | None, query: str, limit: int = 10) -> str:
+        """Search the user's knowledge graph for nodes matching a description.
+
+        Always search before adding a node, and reuse an existing node that
+        states the same idea in other words.
+
+        Args:
+            query: Words describing the idea to look for.
+            limit: Maximum number of nodes to return.
+        """
+
+        terms = re.findall(r"\w+", str(query or ""))
+        if not terms:
+            return "ERROR: query must contain words to search for."
+        match = " OR ".join('"' + term + '"' for term in terms)
+        limit = max(1, min(int(limit), 50))
+
+        def work(conn):
+            ids = [
+                row["rowid"]
+                for row in conn.execute(
+                    "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?"
+                    " ORDER BY bm25(nodes_fts) LIMIT ?",
+                    (match, limit),
+                )
+            ]
+            states = node_states(conn)
+            return [states[node] for node in ids if node in states]
+
+        found = _run(work)
+        if not found:
+            return "No matching nodes."
+        return "\n".join(_describe(node_state) for node_state in found)
+
+
+search_knowledge = SearchKnowledge()
+
+
+class AddKnowledge(LearningTool):
+    name = "add_knowledge"
+    study = True
+
+    def call(
+        self,
+        state: State | None,
+        statement: str,
+        depends_on: list[int] | None = None,
+    ) -> str:
+        """Add a node to the user's knowledge graph.
+
+        Search with search_knowledge first. A node is one true, specific,
+        self-contained statement about the wider world, worded objectively
+        rather than about the user, never about code or files on this machine. Record a misconception as the correct statement, then record
+        evidence that the user doesn't understand it.
+
+        Args:
+            statement: The true statement this node represents.
+            depends_on: IDs of existing nodes that must be understood before
+                this one can be.
+        """
+
+        fields, error = _require_text(statement=statement)
+        if error:
+            return error
+        prerequisites = sorted(set(depends_on or []))
+
+        def work(conn):
+            missing = _missing_nodes(conn, prerequisites)
+            if missing:
+                return None, f"ERROR: no node with id {', '.join(map(str, missing))}."
+            created = _timestamp()
+            node = conn.execute(
+                "INSERT INTO nodes (statement, created_at) VALUES (?, ?)",
+                (fields["statement"], created),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO nodes_fts (rowid, statement) VALUES (?, ?)",
+                (node, fields["statement"]),
             )
-        if not rows:
-            lines.append("  none")
-        return "\n".join(lines)
+            conn.executemany(
+                "INSERT INTO dependencies (node_id, depends_on_id, created_at) VALUES (?, ?, ?)",
+                [(node, prerequisite, created) for prerequisite in prerequisites],
+            )
+            return node, None
 
-    return _run(work)
+        node, error = _run(work)
+        return error or f"Added node {node}."
+
+
+add_knowledge = AddKnowledge()
+
+
+class AddDependency(LearningTool):
+    name = "add_dependency"
+    study = True
+
+    def call(self, state: State | None, node_id: int, depends_on_id: int) -> str:
+        """Record that understanding one node requires understanding another.
+
+        Args:
+            node_id: The node that depends on the other.
+            depends_on_id: The node that must be understood first.
+        """
+
+        if node_id == depends_on_id:
+            return "ERROR: a node cannot depend on itself."
+
+        def work(conn):
+            missing = _missing_nodes(conn, (node_id, depends_on_id))
+            if missing:
+                return f"ERROR: no node with id {', '.join(map(str, missing))}."
+            if _depends_transitively(conn, depends_on_id, node_id):
+                return (
+                    f"ERROR: node {depends_on_id} already depends on node {node_id}, "
+                    "so this link would create a cycle."
+                )
+            conn.execute(
+                "INSERT OR IGNORE INTO dependencies (node_id, depends_on_id, created_at)"
+                " VALUES (?, ?, ?)",
+                (node_id, depends_on_id, _timestamp()),
+            )
+            return f"Node {node_id} now depends on node {depends_on_id}."
+
+        return _run(work)
+
+
+add_dependency = AddDependency()
+
+
+class RecordUnderstanding(LearningTool):
+    name = "record_understanding"
+    study = True
+    writes = {CYCLE}
+    init = {CYCLE: dict}
+
+    def call(
+        self,
+        state: State | None,
+        node_id: int,
+        understands: bool,
+        evidence: str,
+    ) -> str:
+        """Record evidence of whether the user understands a node.
+
+        Call this after every answer, for each node the answer bears on. Record
+        the node your question asked about first: the first record for each
+        user message is graded as their answer, and its result tells you what to
+        do next. The harness records the time and a pointer to the user's latest
+        message.
+
+        Args:
+            node_id: The node the evidence is about.
+            understands: True if the user understands the node, False if not.
+            evidence: What the user said or did that revealed knowledge or lack
+                thereof on the node.
+        """
+
+        fields, error = _require_text(evidence=evidence)
+        if error:
+            return error
+        if not isinstance(understands, bool):
+            return "ERROR: understands must be true or false."
+
+        pointer = _pointer(state)
+        cycle = _cycle(state) if state is not None else None
+        # The first record for each user message is the answer that advances the
+        # cycle; later records on the same message are extra evidence.
+        answers = (
+            cycle is not None
+            and getattr(state, STUDY_FLAG, False)
+            and (pointer[2] is None or pointer[2] != cycle.get("answered_entry"))
+        )
+        phase = cycle.get("phase") if answers else None
+        row = (
+            node_id, int(understands), fields["evidence"], _timestamp(), *pointer,
+            phase if phase in QUESTION_PHASES else None,
+        )
+        cfg = load_config()
+
+        def work(conn):
+            if _missing_nodes(conn, (node_id,)):
+                return f"ERROR: no node with id {node_id}."
+            evidence_id = conn.execute(
+                "INSERT INTO evidence (node_id, understands, evidence, observed_at, source_kind,"
+                " project, session_id, user_entry_index, question_phase)"
+                " VALUES (?, ?, ?, ?, 'study', ?, ?, ?, ?)",
+                row,
+            ).lastrowid
+            if not answers:
+                return "Recorded."
+            cycle["answered_entry"] = pointer[2]
+            answer = conn.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
+            return "Recorded. Next:\n" + _advance(conn, cycle, cfg, _now(), answer)
+
+        return _run(work)
+
+
+record_understanding = RecordUnderstanding()
+
+
+class ViewKnowledge(LearningTool):
+    name = "view_knowledge"
+    study = True
+
+    def call(self, state: State | None, node_id: int) -> str:
+        """Show a node, its dependency links, and all evidence recorded against it.
+
+        Args:
+            node_id: The node to show.
+        """
+
+        now = _now()
+
+        def work(conn):
+            states = node_states(conn, now)
+            node = states.get(node_id)
+            if node is None:
+                return f"ERROR: no node with id {node_id}."
+            lines = [f"{_flag(node)}{_describe(node)}", _describe_review(node, now)]
+            lines.append("Depends on:")
+            lines += [
+                f"  {_flag(states[p])}{_describe(states[p])}" for p in node.depends_on
+            ] or ["  nothing"]
+            lines.append("Depended on by:")
+            lines += [
+                f"  {_flag(states[d])}{_describe(states[d])}" for d in node.dependents
+            ] or ["  nothing"]
+            lines.append("Evidence, newest first:")
+            rows = conn.execute(
+                "SELECT * FROM evidence WHERE node_id = ? ORDER BY observed_at DESC, id DESC",
+                (node_id,),
+            ).fetchall()
+            for row in rows:
+                verdict = "understands" if row["understands"] else "doesn't understand"
+                source = row["source_kind"]
+                if row["observation_id"] is not None:
+                    source += f" {row['observation_id']}"
+                if row["question_phase"]:
+                    source += f", {row['question_phase']} answer"
+                lines.append(
+                    f"  {row['observed_at'][:16]} {verdict} ({source}; {_format_pointer(row)}): "
+                    f"{row['evidence']}"
+                )
+            if not rows:
+                lines.append("  none")
+            return "\n".join(lines)
+
+        return _run(work)
+
+
+view_knowledge = ViewKnowledge()
 
 
 def _describe_observation(row: sqlite3.Row) -> str:
@@ -951,62 +1013,74 @@ def _describe_observation(row: sqlite3.Row) -> str:
     )
 
 
-@_learning_tool(study=True)
-def attach_observation(observation_id: int, node_id: int, state=None) -> str:
-    """Attach a passive observation to the node it concerns, recording it as
-    evidence on that node. An observation may be attached to several nodes.
+class AttachObservation(LearningTool):
+    name = "attach_observation"
+    study = True
 
-    Args:
-        observation_id: The observation to attach.
-        node_id: The node the observation is about.
-    """
+    def call(self, state: State | None, observation_id: int, node_id: int) -> str:
+        """Attach a passive observation to the node it concerns, recording it as
+        evidence on that node. An observation may be attached to several nodes.
 
-    def work(conn):
-        obs = conn.execute(
-            "SELECT * FROM observations WHERE id = ?", (observation_id,)
-        ).fetchone()
-        if obs is None:
-            return f"ERROR: no observation with id {observation_id}."
-        if _missing_nodes(conn, (node_id,)):
-            return f"ERROR: no node with id {node_id}."
-        try:
+        Args:
+            observation_id: The observation to attach.
+            node_id: The node the observation is about.
+        """
+
+        def work(conn):
+            obs = conn.execute(
+                "SELECT * FROM observations WHERE id = ?", (observation_id,)
+            ).fetchone()
+            if obs is None:
+                return f"ERROR: no observation with id {observation_id}."
+            if _missing_nodes(conn, (node_id,)):
+                return f"ERROR: no node with id {node_id}."
+            try:
+                conn.execute(
+                    "INSERT INTO evidence (node_id, understands, evidence, observed_at,"
+                    " source_kind, observation_id, project, session_id, user_entry_index)"
+                    " VALUES (?, ?, ?, ?, 'observation', ?, ?, ?, ?)",
+                    (
+                        node_id, obs["understands"], obs["evidence"], obs["created_at"],
+                        observation_id, obs["project"], obs["session_id"], obs["user_entry_index"],
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                return f"Observation {observation_id} is already attached to node {node_id}."
+            return f"Attached observation {observation_id} to node {node_id}."
+
+        return _run(work)
+
+
+attach_observation = AttachObservation()
+
+
+class DismissObservation(LearningTool):
+    name = "dismiss_observation"
+    study = True
+
+    def call(self, state: State | None, observation_id: int) -> str:
+        """Dismiss a passive observation the user doesn't want to study.
+
+        Args:
+            observation_id: The observation to dismiss.
+        """
+
+        def work(conn):
+            if conn.execute(
+                "SELECT 1 FROM observations WHERE id = ?", (observation_id,)
+            ).fetchone() is None:
+                return f"ERROR: no observation with id {observation_id}."
             conn.execute(
-                "INSERT INTO evidence (node_id, understands, evidence, observed_at,"
-                " source_kind, observation_id, project, session_id, user_entry_index)"
-                " VALUES (?, ?, ?, ?, 'observation', ?, ?, ?, ?)",
-                (
-                    node_id, obs["understands"], obs["evidence"], obs["created_at"],
-                    observation_id, obs["project"], obs["session_id"], obs["user_entry_index"],
-                ),
+                "INSERT OR IGNORE INTO observation_dismissals (observation_id, dismissed_at)"
+                " VALUES (?, ?)",
+                (observation_id, _timestamp()),
             )
-        except sqlite3.IntegrityError:
-            return f"Observation {observation_id} is already attached to node {node_id}."
-        return f"Attached observation {observation_id} to node {node_id}."
+            return f"Dismissed observation {observation_id}."
 
-    return _run(work)
+        return _run(work)
 
 
-@_learning_tool(study=True)
-def dismiss_observation(observation_id: int, state=None) -> str:
-    """Dismiss a passive observation the user doesn't want to study.
-
-    Args:
-        observation_id: The observation to dismiss.
-    """
-
-    def work(conn):
-        if conn.execute(
-            "SELECT 1 FROM observations WHERE id = ?", (observation_id,)
-        ).fetchone() is None:
-            return f"ERROR: no observation with id {observation_id}."
-        conn.execute(
-            "INSERT OR IGNORE INTO observation_dismissals (observation_id, dismissed_at)"
-            " VALUES (?, ?)",
-            (observation_id, _timestamp()),
-        )
-        return f"Dismissed observation {observation_id}."
-
-    return _run(work)
+dismiss_observation = DismissObservation()
 
 
 # ---------------------------------------------------------------------------
@@ -1428,8 +1502,8 @@ the user reads it between other tasks.
 class StudyPromptInstructions(RenderTransformRegistrar):
     """Append study-session instructions to the system prompt while studying."""
 
+    handles = (RenderRequested,)
     reads = {"entries"}
-    writes = {"entries"}
     optional_reads = {STUDY_FLAG}
 
     @staticmethod
@@ -1450,16 +1524,18 @@ class StudyPromptInstructions(RenderTransformRegistrar):
 
         return transform
 
-    def __call__(self, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        assert isinstance(event, RenderRequested)
+        if event.channels is not None and MODEL_RENDER_CHANNEL not in event.channels:
+            return
         if not getattr(state, "entries", None):
-            return state
+            return
         entry = state.entries[0]
-        entry.register_render_transform(
+        entry.append_render_transform(
             MODEL_RENDER_CHANNEL,
             self._make_transform(entry),
             name="learning study-session system prompt",
         )
-        return state
 
 
 # ---------------------------------------------------------------------------
@@ -1473,30 +1549,40 @@ STUDY_START_MESSAGE = (
 )
 
 
-def _publish_learning_tools(state) -> None:
-    # Commands do not run the pipeline, and tools publish their availability
-    # only when it runs. Republish now so the next model request offers the
-    # tools for the new mode, not the ones from before the toggle.
-    if getattr(state, "tool_schemas", None) is None:
-        return
-    for tool in (characterize_user_understanding, *STUDY_TOOLS):
-        tool._publish(state)
-
-
 def _user_message(text: str) -> str:
     # Matches how the runtime frames typed user input.
     return f"--- USER ---\n{text}\n--- END USER ---"
 
 
-def _study_on(ctx, message: str = ""):
+def _append_entry(state: Any, content: str, *, system_generated: bool = False) -> Entry:
+    entries = getattr(state, "entries", None)
+    if entries is None:
+        entries = []
+        state.entries = entries
+    entry = Entry(
+        messages=[{"role": "user", "content": content}],
+        index=len(entries),
+        step=int(getattr(state, "step", 0) or 0),
+        system_generated=system_generated,
+    )
+    entries.append(entry)
+    state.dirty = True
+    state.done = False
+    return entry
+
+
+def _study_on(ctx: CommandContext, message: str = "") -> CommandResult:
     message = str(message or "").strip()
     if getattr(ctx.state, STUDY_FLAG, False):
         if message:
-            ctx.session.inject(_user_message(message))
-            return CommandResult.notice("Study session is already on; sent your message.")
-        return CommandResult.notice("Study session is already on.")
+            _append_entry(ctx.state, _user_message(message))
+            return CommandResult.notice(
+                "Study session is already on; sent your message.",
+                events=(RenderRequested(), BeforeLLM()),
+                force_follow=True,
+            )
+        return CommandResult.notice("Study session is already on.", refresh=False)
     setattr(ctx.state, STUDY_FLAG, True)
-    _publish_learning_tools(ctx.state)
 
     cycle = _cycle(ctx.state)
     _new_cycle(cycle)
@@ -1505,9 +1591,10 @@ def _study_on(ctx, message: str = ""):
     if message:
         step = _run(lambda conn: _directed_step(conn, cycle, cfg, _now()))
         # Queued interrupts are held until after a pending user message is
-        # answered, so inject both entries directly to keep them in order.
-        ctx.session.inject(STUDY_START_MESSAGE + step, system_generated=True)
-        ctx.session.inject(_user_message(message))
+        # answered, so append both entries directly to keep them in order.
+        _append_entry(ctx.state, STUDY_START_MESSAGE + step, system_generated=True)
+        _append_entry(ctx.state, _user_message(message))
+        events: tuple[Event, ...] = (RenderRequested(), BeforeLLM())
     else:
         step = _run(lambda conn: _advance(conn, cycle, cfg, _now(), None))
         # Interrupt delivery waits for a valid slot after any unanswered user
@@ -1515,15 +1602,15 @@ def _study_on(ctx, message: str = ""):
         pending = list(getattr(ctx.state, "pending_interrupts", None) or [])
         pending.append(STUDY_START_MESSAGE + step)
         ctx.state.pending_interrupts = pending
+        events = (InterruptQueued(source="learning"), RenderRequested(), BeforeLLM())
     # Messages up to now, including the /study message, are not answers.
     cycle["answered_entry"] = _latest_user_entry_index(ctx.state)
-    return CommandResult.notice("Study session on.")
+    return CommandResult.notice("Study session on.", events=events, force_follow=True)
 
 
-def _study_off(ctx):
+def _study_off(ctx: CommandContext) -> CommandResult:
     setattr(ctx.state, STUDY_FLAG, False)
-    _publish_learning_tools(ctx.state)
-    return CommandResult.notice("Study session off.")
+    return CommandResult.notice("Study session off.", events=(RenderRequested(),))
 
 
 # ---------------------------------------------------------------------------

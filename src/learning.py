@@ -2000,3 +2000,329 @@ def register_features(builder, *, config):
         components=[_make_setting(option, box) for option in CONFIG_OPTIONS],
         order=[Setting],
     ))
+
+
+# ---------------------------------------------------------------------------
+# Deterministic Simulation Testing (DST) Hooks
+# ---------------------------------------------------------------------------
+
+
+def register_sim_handlers(sim: Any, rng: Any) -> None:
+    """Register deterministic in-memory simulation handlers for all ``LearningRequest`` ops."""
+    from agent_utils.runtime.simulation import SimOutcome
+
+    base_epoch = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    store: dict[str, Any] = {
+        "nodes": {
+            1: "TCP provides reliable ordered byte-stream delivery",
+            2: "HTTP/1.1 runs over persistent TCP connections",
+        },
+        "deps": {(2, 1)},
+        "observations": {
+            1: {
+                "id": 1,
+                "created_at": "2026-01-01T00:00:00+00:00",
+                "topic": "TCP sliding window flow control",
+                "evidence": "Asked how TCP prevents receiver buffer overflow",
+                "understands": False,
+                "project": "sim",
+                "session_id": "sim-0",
+                "user_entry_index": 0,
+            }
+        },
+        "dismissed": set(),
+        "attached": set(),
+        "evidence": [],
+        "next_node_id": 3,
+        "next_obs_id": 2,
+    }
+
+    def _sim_ts(s: Any) -> str:
+        return (base_epoch + timedelta(seconds=float(s.now))).isoformat(timespec="seconds")
+
+    def _depends_transitively_mem(start: int, target: int) -> bool:
+        seen = {start}
+        frontier = [start]
+        while frontier:
+            cur = frontier.pop()
+            if cur == target:
+                return True
+            for node_id, dep_id in store["deps"]:
+                if node_id == cur and dep_id not in seen:
+                    seen.add(dep_id)
+                    frontier.append(dep_id)
+        return False
+
+    def _handle_learning_request(_op_id: OpId, req: LearningRequest, _sim: Any) -> SimOutcome:
+        import sys as _sys
+
+        delay = rng.uniform(0.01, 0.05)
+        if rng.random() < 0.04:
+            return SimOutcome(
+                error=sqlite3.OperationalError("simulated database locked"),
+                delay=delay,
+            )
+
+        ts = _sim_ts(_sim)
+        nodes: dict[int, str] = store["nodes"]
+        deps: set[tuple[int, int]] = store["deps"]
+        observations: dict[int, dict[str, Any]] = store["observations"]
+        req_name = type(req).__name__
+        req_mod = _sys.modules.get(type(req).__module__)
+        rec_result_cls = getattr(req_mod, "RecordUnderstandingResult", RecordUnderstandingResult)
+        study_result_cls = getattr(req_mod, "StudyPickTopicResult", StudyPickTopicResult)
+
+        if isinstance(req, CharacterizeUnderstandingOp) or req_name == "CharacterizeUnderstandingOp":
+            oid = store["next_obs_id"]
+            store["next_obs_id"] = oid + 1
+            observations[oid] = {
+                "id": oid,
+                "created_at": ts,
+                "topic": req.topic,
+                "evidence": req.evidence,
+                "understands": bool(req.understands),
+                "project": req.project,
+                "session_id": req.session_id,
+                "user_entry_index": req.user_entry_index,
+            }
+            return SimOutcome(value="Recorded.", delay=delay)
+
+        if isinstance(req, SearchKnowledgeOp) or req_name == "SearchKnowledgeOp":
+            terms = [t.lower() for t in re.findall(r"\w+", str(req.query or ""))]
+            if not terms:
+                return SimOutcome(value="ERROR: query must contain words to search for.", delay=delay)
+            limit = max(1, min(int(req.limit), 50))
+            matches = [
+                f"node {nid}: {stmt} (simulated)"
+                for nid, stmt in sorted(nodes.items())
+                if any(term in stmt.lower() for term in terms)
+            ][:limit]
+            return SimOutcome(
+                value="\n".join(matches) if matches else "No matching nodes.",
+                delay=delay,
+            )
+
+        if isinstance(req, AddKnowledgeOp) or req_name == "AddKnowledgeOp":
+            prereqs = sorted(set(req.depends_on))
+            missing = [nid for nid in prereqs if nid not in nodes]
+            if missing:
+                return SimOutcome(
+                    value=f"ERROR: no node with id {', '.join(map(str, missing))}.",
+                    delay=delay,
+                )
+            nid = store["next_node_id"]
+            store["next_node_id"] = nid + 1
+            nodes[nid] = req.statement
+            for prereq in prereqs:
+                deps.add((nid, prereq))
+            return SimOutcome(value=f"Added node {nid}.", delay=delay)
+
+        if isinstance(req, AddDependencyOp) or req_name == "AddDependencyOp":
+            missing = [nid for nid in (req.node_id, req.depends_on_id) if nid not in nodes]
+            if missing:
+                return SimOutcome(
+                    value=f"ERROR: no node with id {', '.join(map(str, missing))}.",
+                    delay=delay,
+                )
+            if _depends_transitively_mem(req.depends_on_id, req.node_id):
+                return SimOutcome(
+                    value=(
+                        f"ERROR: node {req.depends_on_id} already depends on node {req.node_id}, "
+                        "so this link would create a cycle."
+                    ),
+                    delay=delay,
+                )
+            deps.add((req.node_id, req.depends_on_id))
+            return SimOutcome(
+                value=f"Node {req.node_id} now depends on node {req.depends_on_id}.",
+                delay=delay,
+            )
+
+        if isinstance(req, RecordUnderstandingOp) or req_name == "RecordUnderstandingOp":
+            cycle = copy.deepcopy(req.cycle) if isinstance(req.cycle, dict) else None
+            if req.node_id not in nodes:
+                return SimOutcome(
+                    value=rec_result_cls(
+                        text=f"ERROR: no node with id {req.node_id}.",
+                        cycle=cycle,
+                    ),
+                    delay=delay,
+                )
+            store["evidence"].append(
+                {
+                    "node_id": req.node_id,
+                    "understands": bool(req.understands),
+                    "evidence": req.evidence,
+                    "observed_at": ts,
+                    "source_kind": "study",
+                }
+            )
+            if not req.answers or cycle is None:
+                return SimOutcome(
+                    value=rec_result_cls(text="Recorded.", cycle=cycle),
+                    delay=delay,
+                )
+            if "asked" not in cycle:
+                _new_cycle(cycle)
+            cycle["answered_entry"] = req.user_entry_index
+            cycle["asked"].append(req.node_id)
+            cycle["anchor_node_id"] = req.node_id
+            prev_phase = str(cycle.get("phase") or "")
+            if prev_phase == "review":
+                cycle["reviews_done"] = int(cycle.get("reviews_done", 0)) + 1
+                next_phase = "teach" if not req.understands else "probe"
+            elif prev_phase in ("probe", "orient"):
+                cycle["probes_done"] = int(cycle.get("probes_done", 0)) + 1
+                cycle["last_probe"] = {"node_id": req.node_id, "understands": bool(req.understands)}
+                next_phase = "teach" if not req.understands else "probe"
+            elif prev_phase == "teach":
+                cycle["teach_attempts"] = int(cycle.get("teach_attempts", 0)) + 1
+                next_phase = "teach" if (not req.understands and cycle["teach_attempts"] < 2) else "probe"
+            else:
+                next_phase = "probe"
+            cycle["phase"] = next_phase
+            return SimOutcome(
+                value=rec_result_cls(
+                    text=f"Recorded. Next:\nStep: {next_phase}\nAsk one question. {_FINISH_QUESTION}",
+                    cycle=cycle,
+                ),
+                delay=delay,
+            )
+
+        if isinstance(req, ViewKnowledgeOp) or req_name == "ViewKnowledgeOp":
+            stmt = nodes.get(req.node_id)
+            if stmt is None:
+                return SimOutcome(value=f"ERROR: no node with id {req.node_id}.", delay=delay)
+            dep_list = sorted(d for n, d in deps if n == req.node_id and d in nodes)
+            rev_list = sorted(n for n, d in deps if d == req.node_id and n in nodes)
+            lines = [
+                f"node {req.node_id}: {stmt}",
+                "Depends on:",
+                *(f"  node {d}: {nodes[d]}" for d in dep_list),
+                *(["  nothing"] if not dep_list else []),
+                "Depended on by:",
+                *(f"  node {n}: {nodes[n]}" for n in rev_list),
+                *(["  nothing"] if not rev_list else []),
+            ]
+            return SimOutcome(value="\n".join(lines), delay=delay)
+
+        if isinstance(req, AttachObservationOp) or req_name == "AttachObservationOp":
+            if req.observation_id not in observations:
+                return SimOutcome(
+                    value=f"ERROR: no observation with id {req.observation_id}.",
+                    delay=delay,
+                )
+            if req.node_id not in nodes:
+                return SimOutcome(value=f"ERROR: no node with id {req.node_id}.", delay=delay)
+            pair = (req.observation_id, req.node_id)
+            if pair in store["attached"]:
+                return SimOutcome(
+                    value=f"Observation {req.observation_id} is already attached to node {req.node_id}.",
+                    delay=delay,
+                )
+            store["attached"].add(pair)
+            return SimOutcome(
+                value=f"Attached observation {req.observation_id} to node {req.node_id}.",
+                delay=delay,
+            )
+
+        if isinstance(req, DismissObservationOp) or req_name == "DismissObservationOp":
+            if req.observation_id not in observations:
+                return SimOutcome(
+                    value=f"ERROR: no observation with id {req.observation_id}.",
+                    delay=delay,
+                )
+            store["dismissed"].add(req.observation_id)
+            return SimOutcome(value=f"Dismissed observation {req.observation_id}.", delay=delay)
+
+        if isinstance(req, StudyPickTopicOp) or req_name == "StudyPickTopicOp":
+            cycle = copy.deepcopy(req.cycle) if isinstance(req.cycle, dict) else {}
+            if "asked" not in cycle:
+                _new_cycle(cycle)
+            _issue(cycle, "probe", None)
+            step = (
+                "Step: probe (question 1 of up to 3 before teaching)\n"
+                "Ask one question that finds where the user's understanding runs out. "
+                + _FINISH_QUESTION
+            )
+            return SimOutcome(value=study_result_cls(step=step, cycle=cycle), delay=delay)
+
+        return SimOutcome(
+            error=TypeError(f"Unsupported LearningRequest: {type(req).__name__}"),
+            delay=delay,
+        )
+
+    import sys as _sys
+
+    sim.register_handler(LearningRequest, _handle_learning_request)
+    live_cls = getattr(_sys.modules.get(__name__), "LearningRequest", None)
+    if isinstance(live_cls, type) and live_cls is not LearningRequest:
+        sim.register_handler(live_cls, _handle_learning_request)
+
+
+def fuzz_tool_args(tool_name: str, rng: Any, state: State) -> dict[str, Any] | None:
+    """Provide deterministic realistic arguments for learning tools."""
+    del state
+    if tool_name == "characterize_user_understanding":
+        return {
+            "topic": rng.choice(
+                [
+                    "TCP congestion control additive increase",
+                    "HTTP keep-alive connection reuse",
+                    "B-tree page splitting under write load",
+                ]
+            ),
+            "evidence": f"User explained mechanism step {rng.randint(1, 50)}",
+            "understands": rng.choice([True, False]),
+        }
+    if tool_name == "search_knowledge":
+        return {
+            "query": rng.choice(["TCP", "HTTP", "delivery", "unknownterm"]),
+            "limit": rng.randint(1, 10),
+        }
+    if tool_name == "add_knowledge":
+        return {
+            "statement": f"Deterministic concept statement {rng.randint(1, 999)}",
+            "depends_on": rng.choice([[], [1], [2]]),
+        }
+    if tool_name == "add_dependency":
+        return {
+            "node_id": rng.randint(1, 3),
+            "depends_on_id": rng.randint(1, 3),
+        }
+    if tool_name == "record_understanding":
+        return {
+            "node_id": rng.randint(1, 3),
+            "understands": rng.choice([True, False]),
+            "evidence": f"User answered study prompt {rng.randint(1, 50)}",
+        }
+    if tool_name == "view_knowledge":
+        return {"node_id": rng.randint(1, 3)}
+    if tool_name == "attach_observation":
+        return {"observation_id": rng.randint(1, 3), "node_id": rng.randint(1, 3)}
+    if tool_name == "dismiss_observation":
+        return {"observation_id": rng.randint(1, 3)}
+    return None
+
+
+def check_invariants(session: Any) -> None:
+    """Verify structural invariants on durable and ephemeral learning state."""
+    state = session.state
+    durable = state.features.get("learning")
+    if isinstance(durable, LearningState) or type(durable).__name__ == "LearningState":
+        assert isinstance(durable.study_active, bool)
+        assert isinstance(durable.cycle, dict)
+        if durable.cycle:
+            phase = durable.cycle.get("phase", "")
+            assert phase in ("", *QUESTION_PHASES), f"invalid learning cycle phase: {phase!r}"
+            for key in ("reviews_done", "probes_done", "teach_attempts"):
+                val = durable.cycle.get(key, 0)
+                assert isinstance(val, int) and val >= 0, f"invalid {key}: {val!r}"
+            assert isinstance(durable.cycle.get("asked", []), list)
+
+    rt = state.runtime("learning") if callable(getattr(state, "runtime", None)) else None
+    if isinstance(rt, LearningRuntime) or type(rt).__name__ == "LearningRuntime":
+        assert isinstance(rt.pending_study_ops, dict)
+        for op_id, message in rt.pending_study_ops.items():
+            assert isinstance(op_id, str) and op_id
+            assert isinstance(message, str)

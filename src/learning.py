@@ -22,14 +22,11 @@ by every project and session. Thresholds come from the plugin's YAML config.
 
 from __future__ import annotations
 
-from collections import deque
 import copy
 import logging
 import math
 import re
 import sqlite3
-import threading
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -55,9 +52,8 @@ from agent_utils.features.core import (
     RenderTransformRegistrar,
 )
 from agent_utils.features.interrupts import InterruptQueued
-from agent_utils.runtime.driver import Driver
 from agent_zoo.core.feature_state import session_state
-from agent_zoo.durability import PluginStorage, StoreUpdate
+from agent_zoo.durability import PluginStorage, QueuedWorkerDriver, StoreUpdate
 from agent_zoo.events import BeforeLLM, EmitNotice
 from agent_zoo.features.commands import Arg, Command, CommandContext, CommandResult
 from agent_zoo.features.settings import Setting, SettingError
@@ -813,105 +809,16 @@ class StudyPickTopicResult:
     cycle: dict[str, Any]
 
 
-class LearningDriver(Driver):
+class LearningDriver(QueuedWorkerDriver):
     """Commit-class serialized SQLite driver for all learning graph & observation I/O."""
 
     durability = "commit"
     request_types = (LearningRequest,)
+    worker_name = "agent-zoo-learning-db"
 
     def __init__(self, *, db_file: Path | None = None) -> None:
         super().__init__()
         self._db_file = db_file
-        self._cond = threading.Condition(threading.RLock())
-        self._queue: deque[tuple[OpId, LearningRequest]] = deque()
-        self._cancelled: set[OpId] = set()
-        self._in_progress = False
-        self._closing = False
-        self._closed = False
-        self._worker: threading.Thread | None = None
-
-    def start(self, emit: EmitFn) -> None:
-        super().start(emit)
-        with self._cond:
-            self._closing = False
-            self._closed = False
-            if self._worker is None or not self._worker.is_alive():
-                self._worker = threading.Thread(
-                    target=self._worker_loop,
-                    name="agent-zoo-learning-db",
-                    daemon=True,
-                )
-                self._worker.start()
-
-    def submit(self, op_id: OpId, req: IoRequest) -> None:
-        if not isinstance(req, LearningRequest):
-            raise TypeError(
-                f"LearningDriver expected LearningRequest, got {type(req).__name__}"
-            )
-        with self._cond:
-            if self._closing or self._closed or op_id in self._cancelled:
-                return
-            self._queue.append((op_id, req))
-            if self._worker is None or not self._worker.is_alive():
-                self._worker = threading.Thread(
-                    target=self._worker_loop,
-                    name="agent-zoo-learning-db",
-                    daemon=True,
-                )
-                self._worker.start()
-            self._cond.notify_all()
-
-    def cancel(self, op_id: OpId) -> None:
-        with self._cond:
-            self._cancelled.add(op_id)
-
-    def drain(self, *, timeout_s: float | None = None) -> None:
-        deadline = (
-            None
-            if timeout_s is None
-            else (time.monotonic() + max(0.0, float(timeout_s)))
-        )
-        with self._cond:
-            while (self._queue or self._in_progress) and not self._closed:
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return
-                    self._cond.wait(timeout=min(remaining, 0.25))
-                else:
-                    self._cond.wait(timeout=0.25)
-
-    def quiesce(
-        self,
-        *,
-        policy: str = "terminate",
-        deadline: float | None = None,
-    ) -> list[Event]:
-        del policy
-        remaining = (
-            None
-            if deadline is None
-            else max(0.0, float(deadline) - time.monotonic())
-        )
-        self.drain(timeout_s=remaining)
-        return []
-
-    def close(self) -> None:
-        with self._cond:
-            self._closing = True
-            worker = self._worker
-            self._cond.notify_all()
-        if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=5.0)
-        with self._cond:
-            self._closed = True
-            self._worker = None
-            self._cancelled.clear()
-            self._cond.notify_all()
-
-    def _is_fenced(self, op_id: OpId) -> bool:
-        with self._cond:
-            return self._closed or op_id in self._cancelled
 
     def _run_db(self, work):
         conn = connect(self._db_file)
@@ -920,6 +827,13 @@ class LearningDriver(Driver):
                 return work(conn)
         finally:
             conn.close()
+
+    def execute(self, req: IoRequest) -> Any:
+        if not isinstance(req, LearningRequest):
+            raise TypeError(
+                f"LearningDriver expected LearningRequest, got {type(req).__name__}"
+            )
+        return self.execute_request(req)
 
     def execute_request(self, req: LearningRequest) -> Any:
         """Execute one typed ``LearningRequest`` against SQLite (called on worker thread)."""
@@ -1156,38 +1070,6 @@ class LearningDriver(Driver):
             return StudyPickTopicResult(step=step, cycle=cycle)
 
         raise TypeError(f"Unsupported LearningRequest: {type(req).__name__}")
-
-    def _worker_loop(self) -> None:
-        while True:
-            with self._cond:
-                while not self._queue:
-                    if self._closing or self._closed:
-                        return
-                    self._cond.wait(timeout=0.5)
-                op_id, req = self._queue.popleft()
-                cancelled = op_id in self._cancelled
-                if not cancelled:
-                    self._in_progress = True
-
-            if cancelled:
-                with self._cond:
-                    self._cancelled.discard(op_id)
-                    self._cond.notify_all()
-                continue
-
-            try:
-                value = self.execute_request(req)
-                if not self._is_fenced(op_id):
-                    self._safe_emit(IoCompleted(op_id=op_id, value=value))
-            except Exception as exc:
-                log.warning("LearningDriver: %s failed: %s", type(req).__name__, exc)
-                if not self._is_fenced(op_id):
-                    self._safe_emit(IoFailed(op_id=op_id, error=exc))
-            finally:
-                with self._cond:
-                    self._in_progress = False
-                    self._cancelled.discard(op_id)
-                    self._cond.notify_all()
 
 
 # ---------------------------------------------------------------------------

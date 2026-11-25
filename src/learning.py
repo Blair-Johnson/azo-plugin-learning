@@ -46,9 +46,9 @@ from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import DurableSpec, MODEL_RENDER_CHANNEL, Entry, State
 from agent_utils.core.tool import Tool
 from agent_utils.features.core import (
-    ExcludeForgotten,
     IoFence,
     MessageRenderer,
+    RenderPlanFinalizer,
     RenderTransformRegistrar,
 )
 from agent_utils.features.interrupts import InterruptQueued
@@ -1994,7 +1994,7 @@ def register_features(builder, *, config):
     builder.add(Feature(
         name="learning_study",
         components=[*STUDY_TOOLS, StudyPromptInstructions(), LearningStudyHandler()],
-        order=[IoFence, LearningStudyHandler, StudyPromptInstructions, ExcludeForgotten, MessageRenderer],
+        order=[IoFence, LearningStudyHandler, StudyPromptInstructions, RenderPlanFinalizer, MessageRenderer],
         drivers=[LearningDriver],
         durable_state=LEARNING_DURABLE_SPEC,
     ))

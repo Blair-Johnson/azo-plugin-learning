@@ -16,7 +16,7 @@ regex = "*"
 pytest = ">=8"
 
 [feature.test.tasks]
-test = "PYTHONPATH=../agent-zoo:../agent-utils/src:../tmux-pilot/src:src python -m pytest -q"
+test = "PYTHONPATH=../agent-zoo/src:../agent-utils/src:../tmux-pilot/src:src python -m pytest -q"
 
 [environments]
 test = ["test"]

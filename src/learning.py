@@ -22,33 +22,51 @@ by every project and session. Thresholds come from the plugin's YAML config.
 
 from __future__ import annotations
 
+from collections import deque
+import copy
+import logging
 import math
 import re
 import sqlite3
-from dataclasses import dataclass
+import threading
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
-from agent_utils.core.events import Event, RenderRequested
+from agent_utils.core.events import (
+    Event,
+    IoCompleted,
+    IoFailed,
+    IoInterrupted,
+    RenderRequested,
+    SessionRestored,
+)
+from agent_utils.core.io import IoRequest, OpId
 from agent_utils.core.pipeline import EmitFn, Feature
-from agent_utils.core.state import MODEL_RENDER_CHANNEL, Entry, State
+from agent_utils.core.state import DurableSpec, MODEL_RENDER_CHANNEL, Entry, State
 from agent_utils.core.tool import Tool
 from agent_utils.features.core import (
     ExcludeForgotten,
+    IoFence,
     MessageRenderer,
     RenderTransformRegistrar,
 )
 from agent_utils.features.interrupts import InterruptQueued
-from agent_zoo.events import BeforeLLM
+from agent_utils.runtime.driver import Driver
+from agent_zoo.core.feature_state import session_state
+from agent_zoo.durability import PluginStorage, StoreUpdate
+from agent_zoo.events import BeforeLLM, EmitNotice
 from agent_zoo.features.commands import Arg, Command, CommandContext, CommandResult
 from agent_zoo.features.settings import Setting, SettingError
 from agent_zoo.storage.projects import resolve_state_root
 
+log = logging.getLogger("agent_zoo_user_plugin.learning")
+
 _PLUGIN_NAME = "azo-plugin-learning"
-STUDY_FLAG = "learning_study_active"
-CYCLE = "learning_study_cycle"
+_CONFIG_REL_PATH = "config/learning.yaml"
 QUESTION_PHASES = ("review", "probe", "teach", "orient")
 
 
@@ -154,7 +172,11 @@ for _option in CONFIG_OPTIONS:
 
 
 def config_path() -> Path:
-    return resolve_state_root() / "plugin-configs" / _PLUGIN_NAME / "config" / "learning.yaml"
+    return PluginStorage(
+        _PLUGIN_NAME,
+        config_format="yaml",
+        config_filename=_CONFIG_REL_PATH,
+    ).config.path
 
 
 def coerce_option(option: ConfigOption, value: Any) -> int | float:
@@ -177,26 +199,14 @@ def coerce_option(option: ConfigOption, value: Any) -> int | float:
     return value
 
 
-def load_config() -> dict[str, Any]:
-    """Return defaults overlaid with the user's config file.
-
-    Read on every call so edits apply without a reload. Invalid values keep
-    their defaults and are reported in ``_warnings``.
-    """
-
+def _overlay_config_dict(raw: Any, *, source_label: str = "learning.yaml") -> dict[str, Any]:
     cfg: dict[str, Any] = {name: dict(values) for name, values in DEFAULT_CONFIG.items()}
     warnings: list[str] = []
     cfg["_warnings"] = warnings
-    path = config_path()
-    try:
-        raw = yaml.safe_load(path.read_text()) or {}
-    except FileNotFoundError:
-        return cfg
-    except (OSError, yaml.YAMLError) as exc:
-        warnings.append(f"could not read {path}: {exc}")
+    if raw is None:
         return cfg
     if not isinstance(raw, dict):
-        warnings.append(f"{path} is not a mapping")
+        warnings.append(f"{source_label} is not a mapping")
         return cfg
     for section in DEFAULT_CONFIG:
         values = raw.get(section) or {}
@@ -215,85 +225,114 @@ def load_config() -> dict[str, Any]:
     return cfg
 
 
-def _set_yaml_value(text: str, section: str, key: str, scalar: str) -> str:
-    """Set ``section.key`` in a simple block-style YAML file, keeping comments."""
-
-    lines = text.splitlines()
-    header = re.compile(rf"^{re.escape(section)}\s*:\s*(#.*)?$")
-    start = next((i for i, line in enumerate(lines) if header.match(line)), None)
-    if start is None:
-        if lines and lines[-1].strip():
-            lines.append("")
-        lines += [f"{section}:", f"  {key}: {scalar}"]
-        return "\n".join(lines) + "\n"
-
-    end = start + 1
-    while end < len(lines) and (not lines[end].strip() or lines[end][0] in " \t#"):
-        end += 1
-    entry = re.compile(rf"^(\s+){re.escape(key)}\s*:(.*)$")
-    for i in range(start + 1, end):
-        match = entry.match(lines[i])
-        if match:
-            comment = match.group(2).find(" #")
-            suffix = match.group(2)[comment:] if comment >= 0 else ""
-            lines[i] = f"{match.group(1)}{key}: {scalar}{suffix}"
-            return "\n".join(lines) + "\n"
-    insert = end
-    while insert > start + 1 and not lines[insert - 1].strip():
-        insert -= 1
-    lines.insert(insert, f"  {key}: {scalar}")
-    return "\n".join(lines) + "\n"
-
-
-def _replace_file(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(text)
-    temporary.replace(path)
-
-
-def write_config_value(option: ConfigOption, value: int | float) -> None:
-    """Save one option to the config file, leaving everything else unchanged.
-
-    The edit is checked by rereading the whole config. If any other value or
-    warning changed, the original file is restored and SettingError is raised.
-    """
-
+def load_config() -> dict[str, Any]:
+    """Return defaults overlaid with the user's config file (driver/build-time use only)."""
     path = config_path()
     try:
-        original = path.read_text() if path.exists() else None
-    except OSError:
-        raise SettingError(f"Cannot read {path}") from None
-    try:
-        parsed = yaml.safe_load(original or "") or {}
-    except yaml.YAMLError:
-        parsed = None
-    if not isinstance(parsed, dict):
-        raise SettingError(f"{path} is not a valid YAML mapping; fix it before editing here")
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        return _overlay_config_dict({})
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        cfg = _overlay_config_dict({})
+        cfg["_warnings"].append(f"could not read {path}: {exc}")
+        return cfg
+    return _overlay_config_dict(raw, source_label=str(path))
 
-    before = load_config()
-    updated = _set_yaml_value(original or "", option.section, option.key, repr(value))
-    try:
-        _replace_file(path, updated)
-        after = load_config()
-        expected = {name: dict(values) for name, values in before.items() if name != "_warnings"}
-        expected[option.section][option.key] = value
-        if {name: values for name, values in after.items() if name != "_warnings"} != expected:
-            raise ValueError("the saved file did not read back as expected")
-        own = f"{option.section}.{option.key} "
-        if [w for w in after["_warnings"] if not w.startswith(own)] != [
-            w for w in before["_warnings"] if not w.startswith(own)
-        ]:
-            raise ValueError("the saved file produced new warnings")
-    except (OSError, ValueError):
+
+class _LearningConfigBox:
+    """Pure in-memory container for learning settings loaded once at feature build time."""
+
+    def __init__(
+        self,
+        raw_document: dict[str, Any],
+        values: dict[str, Any],
+        *,
+        load_error: str | None = None,
+    ) -> None:
+        self.raw_document: dict[str, Any] = copy.deepcopy(raw_document)
+        self.values: dict[str, Any] = copy.deepcopy(values)
+        self.load_error: str | None = load_error
+
+    def get_value(self, option: ConfigOption) -> int | str:
+        val = self.values[option.section][option.key]
+        return int(val) if isinstance(option.default, int) else format(val, "g")
+
+    def set_value(self, option: ConfigOption, raw_value: Any, ctx: Any) -> None:
+        integer = isinstance(option.default, int)
+        candidate = raw_value
+        if not integer:
+            try:
+                candidate = float(str(raw_value).strip())
+            except ValueError:
+                raise SettingError(f"{option.label} must be a number") from None
         try:
-            if original is None:
-                path.unlink(missing_ok=True)
-            else:
-                _replace_file(path, original)
-        except OSError:
-            pass
-        raise SettingError(f"Could not save {option.label} to {path}") from None
+            coerced = coerce_option(option, candidate)
+        except ValueError as exc:
+            raise SettingError(f"{option.label} {exc}") from None
+        if self.load_error is not None:
+            raise SettingError(self.load_error)
+
+        prev_raw = copy.deepcopy(self.raw_document)
+        prev_values = copy.deepcopy(self.values)
+
+        section_map = self.raw_document.get(option.section)
+        if section_map is None:
+            section_map = {}
+            self.raw_document[option.section] = section_map
+        elif not isinstance(section_map, dict):
+            raise SettingError(
+                f"{option.section} is not a valid YAML mapping; fix it before editing here"
+            )
+        section_map[option.key] = coerced
+        self.values[option.section][option.key] = coerced
+        updated_doc = copy.deepcopy(self.raw_document)
+
+        def _rollback() -> None:
+            self.raw_document = prev_raw
+            self.values = prev_values
+
+        if ctx is not None and callable(getattr(ctx, "submit_persist_io", None)):
+            ctx.submit_persist_io(
+                StoreUpdate(
+                    plugin=_PLUGIN_NAME,
+                    scope="config",
+                    config_filename=_CONFIG_REL_PATH,
+                    value=updated_doc,
+                ),
+                rollback=_rollback,
+            )
+
+
+def _load_config_box() -> _LearningConfigBox:
+    """Build-time YAML loader populating an in-memory ``_LearningConfigBox``."""
+    path = config_path()
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _LearningConfigBox({}, _overlay_config_dict({}))
+    except (OSError, UnicodeError):
+        return _LearningConfigBox(
+            {},
+            _overlay_config_dict({}),
+            load_error=f"Cannot read {path}",
+        )
+    try:
+        parsed = yaml.safe_load(raw_text)
+    except yaml.YAMLError:
+        return _LearningConfigBox(
+            {},
+            _overlay_config_dict({}),
+            load_error=f"{path} is not a valid YAML mapping; fix it before editing here",
+        )
+    if parsed is None:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        return _LearningConfigBox(
+            {},
+            _overlay_config_dict({}),
+            load_error=f"{path} is not a valid YAML mapping; fix it before editing here",
+        )
+    return _LearningConfigBox(parsed, _overlay_config_dict(parsed, source_label=str(path)))
 
 
 # ---------------------------------------------------------------------------
@@ -422,15 +461,70 @@ _PENDING_OBSERVATIONS = (
 
 
 # ---------------------------------------------------------------------------
-# Transcript pointers
+# Per-session durable & runtime state + transcript pointers
 # ---------------------------------------------------------------------------
 
+
+@dataclass
+class LearningState:
+    """Durable per-session study mode and cycle position."""
+
+    study_active: bool = False
+    cycle: dict[str, Any] = field(default_factory=dict)
+
+
+LEARNING_DURABLE_SPEC = DurableSpec(
+    name="learning",
+    cls=LearningState,
+    version=1,
+    on_fork="reset",
+)
+
+
+@dataclass
+class LearningRuntime:
+    """Strictly ephemeral per-session runtime tracking for in-flight /study ops."""
+
+    pending_study_ops: dict[str, str] = field(default_factory=dict)
+
+
+def _learning_state(state: Any) -> LearningState:
+    if state is None:
+        return LearningState()
+    durable_fn = getattr(state, "durable", None)
+    if callable(durable_fn):
+        return durable_fn(LEARNING_DURABLE_SPEC)
+    existing = getattr(state, "_learning_state_fallback", None)
+    if not isinstance(existing, LearningState):
+        existing = LearningState()
+        try:
+            setattr(state, "_learning_state_fallback", existing)
+        except Exception:
+            pass
+    return existing
+
+
+def _learning_runtime(state: Any) -> LearningRuntime:
+    if state is None:
+        return LearningRuntime()
+    rt_fn = getattr(state, "runtime", None)
+    if callable(rt_fn):
+        return rt_fn("learning", LearningRuntime)
+    existing = getattr(state, "_learning_runtime_fallback", None)
+    if not isinstance(existing, LearningRuntime):
+        existing = LearningRuntime()
+        try:
+            setattr(state, "_learning_runtime_fallback", existing)
+        except Exception:
+            pass
+    return existing
+
+
 def _current_session_id(state: Any) -> str:
-    run_db = getattr(state, "run_db", None)
-    sid = str(getattr(run_db, "session_id", "") or "").strip()
-    if sid:
-        return sid
-    sid = str(getattr(state, "_session_id", "") or "").strip()
+    if state is None:
+        return ""
+    smeta = session_state(state)
+    sid = str(smeta.session_id or "").strip()
     if sid:
         return sid
     context = getattr(state, "_agent_zoo_context", None)
@@ -440,22 +534,15 @@ def _current_session_id(state: Any) -> str:
 
 
 def _current_project(state: Any) -> str:
-    for attr in ("_project_name", "project_name"):
-        value = str(getattr(state, attr, "") or "").strip()
-        if value:
-            return value
+    if state is None:
+        return ""
+    smeta = session_state(state)
+    proj = str(smeta.project_name or "").strip()
+    if proj:
+        return proj
     context = getattr(state, "_agent_zoo_context", None)
     if isinstance(context, dict):
-        value = str(context.get("project_name") or "").strip()
-        if value:
-            return value
-    run_db = getattr(state, "run_db", None)
-    agent_db = getattr(run_db, "agent_db", None)
-    db = str(getattr(agent_db, "path", "") or "").strip()
-    if db:
-        path = Path(db).expanduser()
-        if path.name == "db.sqlite" and path.parent.name:
-            return path.parent.name
+        return str(context.get("project_name") or "").strip()
     return ""
 
 
@@ -638,17 +725,478 @@ def _describe_review(state: NodeState, now: datetime) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tools
+# Typed IoRequests, Results, and Commit-Class LearningDriver
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LearningRequest(IoRequest):
+    """Base class for all LearningDriver SQLite/config IO requests."""
+
+
+@dataclass
+class CharacterizeUnderstandingOp(LearningRequest):
+    topic: str
+    evidence: str
+    understands: bool
+    project: str = ""
+    session_id: str = ""
+    user_entry_index: int | None = None
+    timestamp: str = ""
+
+
+@dataclass
+class SearchKnowledgeOp(LearningRequest):
+    query: str
+    limit: int = 10
+
+
+@dataclass
+class AddKnowledgeOp(LearningRequest):
+    statement: str
+    depends_on: tuple[int, ...] = ()
+    timestamp: str = ""
+
+
+@dataclass
+class AddDependencyOp(LearningRequest):
+    node_id: int
+    depends_on_id: int
+    timestamp: str = ""
+
+
+@dataclass
+class RecordUnderstandingOp(LearningRequest):
+    node_id: int
+    understands: bool
+    evidence: str
+    project: str = ""
+    session_id: str = ""
+    user_entry_index: int | None = None
+    answers: bool = False
+    cycle: dict[str, Any] | None = None
+    timestamp: str = ""
+
+
+@dataclass(frozen=True)
+class RecordUnderstandingResult:
+    text: str
+    cycle: dict[str, Any] | None = None
+
+
+@dataclass
+class ViewKnowledgeOp(LearningRequest):
+    node_id: int
+
+
+@dataclass
+class AttachObservationOp(LearningRequest):
+    observation_id: int
+    node_id: int
+
+
+@dataclass
+class DismissObservationOp(LearningRequest):
+    observation_id: int
+    timestamp: str = ""
+
+
+@dataclass
+class StudyPickTopicOp(LearningRequest):
+    message: str = ""
+    cycle: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class StudyPickTopicResult:
+    step: str
+    cycle: dict[str, Any]
+
+
+class LearningDriver(Driver):
+    """Commit-class serialized SQLite driver for all learning graph & observation I/O."""
+
+    durability = "commit"
+    request_types = (LearningRequest,)
+
+    def __init__(self, *, db_file: Path | None = None) -> None:
+        super().__init__()
+        self._db_file = db_file
+        self._cond = threading.Condition(threading.RLock())
+        self._queue: deque[tuple[OpId, LearningRequest]] = deque()
+        self._cancelled: set[OpId] = set()
+        self._in_progress = False
+        self._closing = False
+        self._closed = False
+        self._worker: threading.Thread | None = None
+
+    def start(self, emit: EmitFn) -> None:
+        super().start(emit)
+        with self._cond:
+            self._closing = False
+            self._closed = False
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._worker_loop,
+                    name="agent-zoo-learning-db",
+                    daemon=True,
+                )
+                self._worker.start()
+
+    def submit(self, op_id: OpId, req: IoRequest) -> None:
+        if not isinstance(req, LearningRequest):
+            raise TypeError(
+                f"LearningDriver expected LearningRequest, got {type(req).__name__}"
+            )
+        with self._cond:
+            if self._closing or self._closed or op_id in self._cancelled:
+                return
+            self._queue.append((op_id, req))
+            if self._worker is None or not self._worker.is_alive():
+                self._worker = threading.Thread(
+                    target=self._worker_loop,
+                    name="agent-zoo-learning-db",
+                    daemon=True,
+                )
+                self._worker.start()
+            self._cond.notify_all()
+
+    def cancel(self, op_id: OpId) -> None:
+        with self._cond:
+            self._cancelled.add(op_id)
+
+    def drain(self, *, timeout_s: float | None = None) -> None:
+        deadline = (
+            None
+            if timeout_s is None
+            else (time.monotonic() + max(0.0, float(timeout_s)))
+        )
+        with self._cond:
+            while (self._queue or self._in_progress) and not self._closed:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    self._cond.wait(timeout=min(remaining, 0.25))
+                else:
+                    self._cond.wait(timeout=0.25)
+
+    def quiesce(
+        self,
+        *,
+        policy: str = "terminate",
+        deadline: float | None = None,
+    ) -> list[Event]:
+        del policy
+        remaining = (
+            None
+            if deadline is None
+            else max(0.0, float(deadline) - time.monotonic())
+        )
+        self.drain(timeout_s=remaining)
+        return []
+
+    def close(self) -> None:
+        with self._cond:
+            self._closing = True
+            worker = self._worker
+            self._cond.notify_all()
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=5.0)
+        with self._cond:
+            self._closed = True
+            self._worker = None
+            self._cancelled.clear()
+            self._cond.notify_all()
+
+    def _is_fenced(self, op_id: OpId) -> bool:
+        with self._cond:
+            return self._closed or op_id in self._cancelled
+
+    def _run_db(self, work):
+        conn = connect(self._db_file)
+        try:
+            with conn:
+                return work(conn)
+        finally:
+            conn.close()
+
+    def execute_request(self, req: LearningRequest) -> Any:
+        """Execute one typed ``LearningRequest`` against SQLite (called on worker thread)."""
+        if isinstance(req, CharacterizeUnderstandingOp):
+            ts = req.timestamp or _timestamp()
+            row = (
+                ts,
+                req.topic,
+                req.evidence,
+                int(req.understands),
+                req.project,
+                req.session_id,
+                req.user_entry_index,
+            )
+            self._run_db(
+                lambda conn: conn.execute(
+                    "INSERT INTO observations (created_at, topic, evidence, understands,"
+                    " project, session_id, user_entry_index) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    row,
+                )
+            )
+            return "Recorded."
+
+        if isinstance(req, SearchKnowledgeOp):
+            terms = re.findall(r"\w+", str(req.query or ""))
+            if not terms:
+                return "ERROR: query must contain words to search for."
+            match = " OR ".join('"' + term + '"' for term in terms)
+            limit = max(1, min(int(req.limit), 50))
+            cfg = load_config()
+
+            def _search(conn):
+                ids = [
+                    row["rowid"]
+                    for row in conn.execute(
+                        "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?"
+                        " ORDER BY bm25(nodes_fts) LIMIT ?",
+                        (match, limit),
+                    )
+                ]
+                states = node_states(conn, cfg=cfg)
+                return [states[node] for node in ids if node in states]
+
+            found = self._run_db(_search)
+            if not found:
+                return "No matching nodes."
+            return "\n".join(_describe(ns) for ns in found)
+
+        if isinstance(req, AddKnowledgeOp):
+            prerequisites = sorted(set(req.depends_on))
+            created = req.timestamp or _timestamp()
+
+            def _add(conn):
+                missing = _missing_nodes(conn, prerequisites)
+                if missing:
+                    return None, f"ERROR: no node with id {', '.join(map(str, missing))}."
+                node = conn.execute(
+                    "INSERT INTO nodes (statement, created_at) VALUES (?, ?)",
+                    (req.statement, created),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO nodes_fts (rowid, statement) VALUES (?, ?)",
+                    (node, req.statement),
+                )
+                conn.executemany(
+                    "INSERT INTO dependencies (node_id, depends_on_id, created_at) VALUES (?, ?, ?)",
+                    [(node, prerequisite, created) for prerequisite in prerequisites],
+                )
+                return node, None
+
+            node, err = self._run_db(_add)
+            return err or f"Added node {node}."
+
+        if isinstance(req, AddDependencyOp):
+            created = req.timestamp or _timestamp()
+
+            def _dep(conn):
+                missing = _missing_nodes(conn, (req.node_id, req.depends_on_id))
+                if missing:
+                    return f"ERROR: no node with id {', '.join(map(str, missing))}."
+                if _depends_transitively(conn, req.depends_on_id, req.node_id):
+                    return (
+                        f"ERROR: node {req.depends_on_id} already depends on node {req.node_id}, "
+                        "so this link would create a cycle."
+                    )
+                conn.execute(
+                    "INSERT OR IGNORE INTO dependencies (node_id, depends_on_id, created_at)"
+                    " VALUES (?, ?, ?)",
+                    (req.node_id, req.depends_on_id, created),
+                )
+                return f"Node {req.node_id} now depends on node {req.depends_on_id}."
+
+            return self._run_db(_dep)
+
+        if isinstance(req, RecordUnderstandingOp):
+            cycle = copy.deepcopy(req.cycle) if isinstance(req.cycle, dict) else None
+            phase = cycle.get("phase") if (req.answers and cycle is not None) else None
+            ts = req.timestamp or _timestamp()
+            row = (
+                req.node_id,
+                int(req.understands),
+                req.evidence,
+                ts,
+                req.project,
+                req.session_id,
+                req.user_entry_index,
+                phase if phase in QUESTION_PHASES else None,
+            )
+            cfg = load_config()
+
+            def _record(conn):
+                if _missing_nodes(conn, (req.node_id,)):
+                    return RecordUnderstandingResult(
+                        text=f"ERROR: no node with id {req.node_id}.",
+                        cycle=cycle,
+                    )
+                evidence_id = conn.execute(
+                    "INSERT INTO evidence (node_id, understands, evidence, observed_at, source_kind,"
+                    " project, session_id, user_entry_index, question_phase)"
+                    " VALUES (?, ?, ?, ?, 'study', ?, ?, ?, ?)",
+                    row,
+                ).lastrowid
+                if not req.answers or cycle is None:
+                    return RecordUnderstandingResult(text="Recorded.", cycle=cycle)
+                cycle["answered_entry"] = req.user_entry_index
+                answer = conn.execute(
+                    "SELECT * FROM evidence WHERE id = ?", (evidence_id,)
+                ).fetchone()
+                text = "Recorded. Next:\n" + _advance(conn, cycle, cfg, _now(), answer)
+                return RecordUnderstandingResult(text=text, cycle=cycle)
+
+            return self._run_db(_record)
+
+        if isinstance(req, ViewKnowledgeOp):
+            now = _now()
+            cfg = load_config()
+
+            def _view(conn):
+                states = node_states(conn, now, cfg)
+                node = states.get(req.node_id)
+                if node is None:
+                    return f"ERROR: no node with id {req.node_id}."
+                lines = [f"{_flag(node)}{_describe(node)}", _describe_review(node, now)]
+                lines.append("Depends on:")
+                lines += [
+                    f"  {_flag(states[p])}{_describe(states[p])}" for p in node.depends_on
+                ] or ["  nothing"]
+                lines.append("Depended on by:")
+                lines += [
+                    f"  {_flag(states[d])}{_describe(states[d])}" for d in node.dependents
+                ] or ["  nothing"]
+                lines.append("Evidence, newest first:")
+                rows = conn.execute(
+                    "SELECT * FROM evidence WHERE node_id = ? ORDER BY observed_at DESC, id DESC",
+                    (req.node_id,),
+                ).fetchall()
+                for row in rows:
+                    verdict = "understands" if row["understands"] else "doesn't understand"
+                    source = row["source_kind"]
+                    if row["observation_id"] is not None:
+                        source += f" {row['observation_id']}"
+                    if row["question_phase"]:
+                        source += f", {row['question_phase']} answer"
+                    lines.append(
+                        f"  {row['observed_at'][:16]} {verdict} ({source}; {_format_pointer(row)}): "
+                        f"{row['evidence']}"
+                    )
+                if not rows:
+                    lines.append("  none")
+                return "\n".join(lines)
+
+            return self._run_db(_view)
+
+        if isinstance(req, AttachObservationOp):
+            def _attach(conn):
+                obs = conn.execute(
+                    "SELECT * FROM observations WHERE id = ?", (req.observation_id,)
+                ).fetchone()
+                if obs is None:
+                    return f"ERROR: no observation with id {req.observation_id}."
+                if _missing_nodes(conn, (req.node_id,)):
+                    return f"ERROR: no node with id {req.node_id}."
+                try:
+                    conn.execute(
+                        "INSERT INTO evidence (node_id, understands, evidence, observed_at,"
+                        " source_kind, observation_id, project, session_id, user_entry_index)"
+                        " VALUES (?, ?, ?, ?, 'observation', ?, ?, ?, ?)",
+                        (
+                            req.node_id,
+                            obs["understands"],
+                            obs["evidence"],
+                            obs["created_at"],
+                            req.observation_id,
+                            obs["project"],
+                            obs["session_id"],
+                            obs["user_entry_index"],
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    return f"Observation {req.observation_id} is already attached to node {req.node_id}."
+                return f"Attached observation {req.observation_id} to node {req.node_id}."
+
+            return self._run_db(_attach)
+
+        if isinstance(req, DismissObservationOp):
+            ts = req.timestamp or _timestamp()
+
+            def _dismiss(conn):
+                if (
+                    conn.execute(
+                        "SELECT 1 FROM observations WHERE id = ?", (req.observation_id,)
+                    ).fetchone()
+                    is None
+                ):
+                    return f"ERROR: no observation with id {req.observation_id}."
+                conn.execute(
+                    "INSERT OR IGNORE INTO observation_dismissals (observation_id, dismissed_at)"
+                    " VALUES (?, ?)",
+                    (req.observation_id, ts),
+                )
+                return f"Dismissed observation {req.observation_id}."
+
+            return self._run_db(_dismiss)
+
+        if isinstance(req, StudyPickTopicOp):
+            cycle = copy.deepcopy(req.cycle) if isinstance(req.cycle, dict) else {}
+            if "asked" not in cycle:
+                _new_cycle(cycle)
+            cfg = load_config()
+            if req.message:
+                step = self._run_db(lambda conn: _directed_step(conn, cycle, cfg, _now()))
+            else:
+                step = self._run_db(lambda conn: _advance(conn, cycle, cfg, _now(), None))
+            return StudyPickTopicResult(step=step, cycle=cycle)
+
+        raise TypeError(f"Unsupported LearningRequest: {type(req).__name__}")
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._cond:
+                while not self._queue:
+                    if self._closing or self._closed:
+                        return
+                    self._cond.wait(timeout=0.5)
+                op_id, req = self._queue.popleft()
+                cancelled = op_id in self._cancelled
+                if not cancelled:
+                    self._in_progress = True
+
+            if cancelled:
+                with self._cond:
+                    self._cancelled.discard(op_id)
+                    self._cond.notify_all()
+                continue
+
+            try:
+                value = self.execute_request(req)
+                if not self._is_fenced(op_id):
+                    self._safe_emit(IoCompleted(op_id=op_id, value=value))
+            except Exception as exc:
+                log.warning("LearningDriver: %s failed: %s", type(req).__name__, exc)
+                if not self._is_fenced(op_id):
+                    self._safe_emit(IoFailed(op_id=op_id, error=exc))
+            finally:
+                with self._cond:
+                    self._in_progress = False
+                    self._cancelled.discard(op_id)
+                    self._cond.notify_all()
+
+
+# ---------------------------------------------------------------------------
+# Tools (100% pure Sans-I/O generator tools yielding LearningRequest)
 # ---------------------------------------------------------------------------
 
 _STATE_READS = {
     "entries",
-    "_session_id",
     "_agent_zoo_context",
-    "run_db",
-    "_project_name",
-    STUDY_FLAG,
-    CYCLE,
 }
 
 
@@ -659,7 +1207,7 @@ class LearningTool(Tool):
     optional_reads: set[str] = set(_STATE_READS)
 
     def available(self, state: State) -> bool:
-        return bool(getattr(state, STUDY_FLAG, False)) == self.study
+        return bool(_learning_state(state).study_active) == self.study
 
 
 def _require_text(**fields: str) -> tuple[dict[str, str], str | None]:
@@ -704,7 +1252,7 @@ class CharacterizeUserUnderstanding(LearningTool):
         topic: str,
         evidence: str,
         understands: bool,
-    ) -> str:
+    ):
         """Characterize whether the user understands something, with brief evidence.
 
         Call this whenever the user reveals what they do or don't understand,
@@ -736,13 +1284,17 @@ class CharacterizeUserUnderstanding(LearningTool):
         if not isinstance(understands, bool):
             return "ERROR: understands must be true or false."
 
-        row = (_timestamp(), fields["topic"], fields["evidence"], int(understands), *_pointer(state))
-        _run(lambda conn: conn.execute(
-            "INSERT INTO observations (created_at, topic, evidence, understands,"
-            " project, session_id, user_entry_index) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            row,
-        ))
-        return "Recorded."
+        project, sid, entry_idx = _pointer(state)
+        outcome = yield CharacterizeUnderstandingOp(
+            topic=fields["topic"],
+            evidence=fields["evidence"],
+            understands=understands,
+            project=project,
+            session_id=sid,
+            user_entry_index=entry_idx,
+            timestamp=_timestamp(),
+        )
+        return str(outcome)
 
 
 characterize_user_understanding = CharacterizeUserUnderstanding()
@@ -752,7 +1304,7 @@ class SearchKnowledge(LearningTool):
     name = "search_knowledge"
     study = True
 
-    def call(self, state: State | None, query: str, limit: int = 10) -> str:
+    def call(self, state: State | None, query: str, limit: int = 10):
         """Search the user's knowledge graph for nodes matching a description.
 
         Always search before adding a node, and reuse an existing node that
@@ -766,25 +1318,11 @@ class SearchKnowledge(LearningTool):
         terms = re.findall(r"\w+", str(query or ""))
         if not terms:
             return "ERROR: query must contain words to search for."
-        match = " OR ".join('"' + term + '"' for term in terms)
-        limit = max(1, min(int(limit), 50))
-
-        def work(conn):
-            ids = [
-                row["rowid"]
-                for row in conn.execute(
-                    "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?"
-                    " ORDER BY bm25(nodes_fts) LIMIT ?",
-                    (match, limit),
-                )
-            ]
-            states = node_states(conn)
-            return [states[node] for node in ids if node in states]
-
-        found = _run(work)
-        if not found:
-            return "No matching nodes."
-        return "\n".join(_describe(node_state) for node_state in found)
+        outcome = yield SearchKnowledgeOp(
+            query=str(query),
+            limit=max(1, min(int(limit), 50)),
+        )
+        return str(outcome)
 
 
 search_knowledge = SearchKnowledge()
@@ -799,7 +1337,7 @@ class AddKnowledge(LearningTool):
         state: State | None,
         statement: str,
         depends_on: list[int] | None = None,
-    ) -> str:
+    ):
         """Add a node to the user's knowledge graph.
 
         Search with search_knowledge first. A node is one true, specific,
@@ -816,29 +1354,13 @@ class AddKnowledge(LearningTool):
         fields, error = _require_text(statement=statement)
         if error:
             return error
-        prerequisites = sorted(set(depends_on or []))
-
-        def work(conn):
-            missing = _missing_nodes(conn, prerequisites)
-            if missing:
-                return None, f"ERROR: no node with id {', '.join(map(str, missing))}."
-            created = _timestamp()
-            node = conn.execute(
-                "INSERT INTO nodes (statement, created_at) VALUES (?, ?)",
-                (fields["statement"], created),
-            ).lastrowid
-            conn.execute(
-                "INSERT INTO nodes_fts (rowid, statement) VALUES (?, ?)",
-                (node, fields["statement"]),
-            )
-            conn.executemany(
-                "INSERT INTO dependencies (node_id, depends_on_id, created_at) VALUES (?, ?, ?)",
-                [(node, prerequisite, created) for prerequisite in prerequisites],
-            )
-            return node, None
-
-        node, error = _run(work)
-        return error or f"Added node {node}."
+        prerequisites = tuple(sorted(set(depends_on or [])))
+        outcome = yield AddKnowledgeOp(
+            statement=fields["statement"],
+            depends_on=prerequisites,
+            timestamp=_timestamp(),
+        )
+        return str(outcome)
 
 
 add_knowledge = AddKnowledge()
@@ -848,7 +1370,7 @@ class AddDependency(LearningTool):
     name = "add_dependency"
     study = True
 
-    def call(self, state: State | None, node_id: int, depends_on_id: int) -> str:
+    def call(self, state: State | None, node_id: int, depends_on_id: int):
         """Record that understanding one node requires understanding another.
 
         Args:
@@ -858,24 +1380,12 @@ class AddDependency(LearningTool):
 
         if node_id == depends_on_id:
             return "ERROR: a node cannot depend on itself."
-
-        def work(conn):
-            missing = _missing_nodes(conn, (node_id, depends_on_id))
-            if missing:
-                return f"ERROR: no node with id {', '.join(map(str, missing))}."
-            if _depends_transitively(conn, depends_on_id, node_id):
-                return (
-                    f"ERROR: node {depends_on_id} already depends on node {node_id}, "
-                    "so this link would create a cycle."
-                )
-            conn.execute(
-                "INSERT OR IGNORE INTO dependencies (node_id, depends_on_id, created_at)"
-                " VALUES (?, ?, ?)",
-                (node_id, depends_on_id, _timestamp()),
-            )
-            return f"Node {node_id} now depends on node {depends_on_id}."
-
-        return _run(work)
+        outcome = yield AddDependencyOp(
+            node_id=node_id,
+            depends_on_id=depends_on_id,
+            timestamp=_timestamp(),
+        )
+        return str(outcome)
 
 
 add_dependency = AddDependency()
@@ -884,8 +1394,6 @@ add_dependency = AddDependency()
 class RecordUnderstanding(LearningTool):
     name = "record_understanding"
     study = True
-    writes = {CYCLE}
-    init = {CYCLE: dict}
 
     def call(
         self,
@@ -893,7 +1401,7 @@ class RecordUnderstanding(LearningTool):
         node_id: int,
         understands: bool,
         evidence: str,
-    ) -> str:
+    ):
         """Record evidence of whether the user understands a node.
 
         Call this after every answer, for each node the answer bears on. Record
@@ -915,38 +1423,30 @@ class RecordUnderstanding(LearningTool):
         if not isinstance(understands, bool):
             return "ERROR: understands must be true or false."
 
-        pointer = _pointer(state)
-        cycle = _cycle(state) if state is not None else None
-        # The first record for each user message is the answer that advances the
-        # cycle; later records on the same message are extra evidence.
+        project, sid, entry_idx = _pointer(state)
+        lst = _learning_state(state) if state is not None else None
+        cycle = copy.deepcopy(lst.cycle) if lst is not None else None
         answers = (
-            cycle is not None
-            and getattr(state, STUDY_FLAG, False)
-            and (pointer[2] is None or pointer[2] != cycle.get("answered_entry"))
+            lst is not None
+            and lst.study_active
+            and (entry_idx is None or entry_idx != lst.cycle.get("answered_entry"))
         )
-        phase = cycle.get("phase") if answers else None
-        row = (
-            node_id, int(understands), fields["evidence"], _timestamp(), *pointer,
-            phase if phase in QUESTION_PHASES else None,
+        outcome = yield RecordUnderstandingOp(
+            node_id=node_id,
+            understands=understands,
+            evidence=fields["evidence"],
+            project=project,
+            session_id=sid,
+            user_entry_index=entry_idx,
+            answers=answers,
+            cycle=cycle,
+            timestamp=_timestamp(),
         )
-        cfg = load_config()
-
-        def work(conn):
-            if _missing_nodes(conn, (node_id,)):
-                return f"ERROR: no node with id {node_id}."
-            evidence_id = conn.execute(
-                "INSERT INTO evidence (node_id, understands, evidence, observed_at, source_kind,"
-                " project, session_id, user_entry_index, question_phase)"
-                " VALUES (?, ?, ?, ?, 'study', ?, ?, ?, ?)",
-                row,
-            ).lastrowid
-            if not answers:
-                return "Recorded."
-            cycle["answered_entry"] = pointer[2]
-            answer = conn.execute("SELECT * FROM evidence WHERE id = ?", (evidence_id,)).fetchone()
-            return "Recorded. Next:\n" + _advance(conn, cycle, cfg, _now(), answer)
-
-        return _run(work)
+        if isinstance(outcome, RecordUnderstandingResult):
+            if lst is not None and outcome.cycle is not None:
+                lst.cycle = outcome.cycle
+            return outcome.text
+        return str(outcome)
 
 
 record_understanding = RecordUnderstanding()
@@ -956,50 +1456,15 @@ class ViewKnowledge(LearningTool):
     name = "view_knowledge"
     study = True
 
-    def call(self, state: State | None, node_id: int) -> str:
+    def call(self, state: State | None, node_id: int):
         """Show a node, its dependency links, and all evidence recorded against it.
 
         Args:
             node_id: The node to show.
         """
 
-        now = _now()
-
-        def work(conn):
-            states = node_states(conn, now)
-            node = states.get(node_id)
-            if node is None:
-                return f"ERROR: no node with id {node_id}."
-            lines = [f"{_flag(node)}{_describe(node)}", _describe_review(node, now)]
-            lines.append("Depends on:")
-            lines += [
-                f"  {_flag(states[p])}{_describe(states[p])}" for p in node.depends_on
-            ] or ["  nothing"]
-            lines.append("Depended on by:")
-            lines += [
-                f"  {_flag(states[d])}{_describe(states[d])}" for d in node.dependents
-            ] or ["  nothing"]
-            lines.append("Evidence, newest first:")
-            rows = conn.execute(
-                "SELECT * FROM evidence WHERE node_id = ? ORDER BY observed_at DESC, id DESC",
-                (node_id,),
-            ).fetchall()
-            for row in rows:
-                verdict = "understands" if row["understands"] else "doesn't understand"
-                source = row["source_kind"]
-                if row["observation_id"] is not None:
-                    source += f" {row['observation_id']}"
-                if row["question_phase"]:
-                    source += f", {row['question_phase']} answer"
-                lines.append(
-                    f"  {row['observed_at'][:16]} {verdict} ({source}; {_format_pointer(row)}): "
-                    f"{row['evidence']}"
-                )
-            if not rows:
-                lines.append("  none")
-            return "\n".join(lines)
-
-        return _run(work)
+        outcome = yield ViewKnowledgeOp(node_id=node_id)
+        return str(outcome)
 
 
 view_knowledge = ViewKnowledge()
@@ -1017,7 +1482,7 @@ class AttachObservation(LearningTool):
     name = "attach_observation"
     study = True
 
-    def call(self, state: State | None, observation_id: int, node_id: int) -> str:
+    def call(self, state: State | None, observation_id: int, node_id: int):
         """Attach a passive observation to the node it concerns, recording it as
         evidence on that node. An observation may be attached to several nodes.
 
@@ -1026,29 +1491,11 @@ class AttachObservation(LearningTool):
             node_id: The node the observation is about.
         """
 
-        def work(conn):
-            obs = conn.execute(
-                "SELECT * FROM observations WHERE id = ?", (observation_id,)
-            ).fetchone()
-            if obs is None:
-                return f"ERROR: no observation with id {observation_id}."
-            if _missing_nodes(conn, (node_id,)):
-                return f"ERROR: no node with id {node_id}."
-            try:
-                conn.execute(
-                    "INSERT INTO evidence (node_id, understands, evidence, observed_at,"
-                    " source_kind, observation_id, project, session_id, user_entry_index)"
-                    " VALUES (?, ?, ?, ?, 'observation', ?, ?, ?, ?)",
-                    (
-                        node_id, obs["understands"], obs["evidence"], obs["created_at"],
-                        observation_id, obs["project"], obs["session_id"], obs["user_entry_index"],
-                    ),
-                )
-            except sqlite3.IntegrityError:
-                return f"Observation {observation_id} is already attached to node {node_id}."
-            return f"Attached observation {observation_id} to node {node_id}."
-
-        return _run(work)
+        outcome = yield AttachObservationOp(
+            observation_id=observation_id,
+            node_id=node_id,
+        )
+        return str(outcome)
 
 
 attach_observation = AttachObservation()
@@ -1058,26 +1505,18 @@ class DismissObservation(LearningTool):
     name = "dismiss_observation"
     study = True
 
-    def call(self, state: State | None, observation_id: int) -> str:
+    def call(self, state: State | None, observation_id: int):
         """Dismiss a passive observation the user doesn't want to study.
 
         Args:
             observation_id: The observation to dismiss.
         """
 
-        def work(conn):
-            if conn.execute(
-                "SELECT 1 FROM observations WHERE id = ?", (observation_id,)
-            ).fetchone() is None:
-                return f"ERROR: no observation with id {observation_id}."
-            conn.execute(
-                "INSERT OR IGNORE INTO observation_dismissals (observation_id, dismissed_at)"
-                " VALUES (?, ?)",
-                (observation_id, _timestamp()),
-            )
-            return f"Dismissed observation {observation_id}."
-
-        return _run(work)
+        outcome = yield DismissObservationOp(
+            observation_id=observation_id,
+            timestamp=_timestamp(),
+        )
+        return str(outcome)
 
 
 dismiss_observation = DismissObservation()
@@ -1094,11 +1533,7 @@ dismiss_observation = DismissObservation()
 # ---------------------------------------------------------------------------
 
 def _cycle(state) -> dict:
-    cycle = getattr(state, CYCLE, None)
-    if not isinstance(cycle, dict):
-        cycle = {}
-        setattr(state, CYCLE, cycle)
-    return cycle
+    return _learning_state(state).cycle
 
 
 def _new_cycle(cycle: dict) -> None:
@@ -1504,12 +1939,11 @@ class StudyPromptInstructions(RenderTransformRegistrar):
 
     handles = (RenderRequested,)
     reads = {"entries"}
-    optional_reads = {STUDY_FLAG}
 
     @staticmethod
     def _make_transform(entry):
         def transform(messages, state, *, _entry=entry):
-            if not getattr(state, STUDY_FLAG, False):
+            if not _learning_state(state).study_active:
                 return messages
             if not messages or _entry.role != "system":
                 return messages
@@ -1539,7 +1973,7 @@ class StudyPromptInstructions(RenderTransformRegistrar):
 
 
 # ---------------------------------------------------------------------------
-# Commands
+# Commands & Pure Sans-I/O Study Session Handler
 # ---------------------------------------------------------------------------
 
 STUDY_START_MESSAGE = (
@@ -1571,9 +2005,59 @@ def _append_entry(state: Any, content: str, *, system_generated: bool = False) -
     return entry
 
 
+class LearningStudyHandler:
+    """Pure Sans-I/O component handling ``StudyPickTopicOp`` completions for ``/study``."""
+
+    handles = (IoCompleted, IoFailed, IoInterrupted, SessionRestored)
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        rt = _learning_runtime(state)
+        if isinstance(event, SessionRestored):
+            rt.pending_study_ops.clear()
+            return
+        if event.op_id not in rt.pending_study_ops:
+            return
+        message = rt.pending_study_ops.pop(event.op_id)
+        lst = _learning_state(state)
+
+        if isinstance(event, IoCompleted):
+            val = event.value
+            if isinstance(val, StudyPickTopicResult):
+                step = val.step
+                lst.cycle = dict(val.cycle)
+            else:
+                step = str(val or "")
+            if message:
+                _append_entry(state, STUDY_START_MESSAGE + step, system_generated=True)
+                _append_entry(state, _user_message(message))
+                lst.cycle["answered_entry"] = _latest_user_entry_index(state)
+                emit(RenderRequested())
+                emit(BeforeLLM())
+            else:
+                pending = list(getattr(state, "pending_interrupts", None) or [])
+                pending.append(STUDY_START_MESSAGE + step)
+                state.pending_interrupts = pending
+                lst.cycle["answered_entry"] = _latest_user_entry_index(state)
+                emit(InterruptQueued(source="learning"))
+                emit(RenderRequested())
+                emit(BeforeLLM())
+            return
+
+        # IoFailed or IoInterrupted
+        lst.study_active = False
+        reason = (
+            str(event.error)
+            if isinstance(event, IoFailed)
+            else str(event.reason or "interrupted")
+        )
+        emit(EmitNotice(text=f"Could not start study session: {reason}", level="warning"))
+        emit(RenderRequested())
+
+
 def _study_on(ctx: CommandContext, message: str = "") -> CommandResult:
     message = str(message or "").strip()
-    if getattr(ctx.state, STUDY_FLAG, False):
+    lst = _learning_state(ctx.state)
+    if lst.study_active:
         if message:
             _append_entry(ctx.state, _user_message(message))
             return CommandResult.notice(
@@ -1582,39 +2066,32 @@ def _study_on(ctx: CommandContext, message: str = "") -> CommandResult:
                 force_follow=True,
             )
         return CommandResult.notice("Study session is already on.", refresh=False)
-    setattr(ctx.state, STUDY_FLAG, True)
 
-    cycle = _cycle(ctx.state)
-    _new_cycle(cycle)
-    cycle["phase"] = ""
-    cfg = load_config()
-    if message:
-        step = _run(lambda conn: _directed_step(conn, cycle, cfg, _now()))
-        # Queued interrupts are held until after a pending user message is
-        # answered, so append both entries directly to keep them in order.
-        _append_entry(ctx.state, STUDY_START_MESSAGE + step, system_generated=True)
-        _append_entry(ctx.state, _user_message(message))
-        events: tuple[Event, ...] = (RenderRequested(), BeforeLLM())
+    lst.study_active = True
+    _new_cycle(lst.cycle)
+    lst.cycle["phase"] = ""
+
+    req = StudyPickTopicOp(message=message, cycle=copy.deepcopy(lst.cycle))
+    submit_fn = getattr(ctx, "submit_io", None)
+    if callable(submit_fn):
+        op_id = submit_fn(req, tag="learning_study")
     else:
-        step = _run(lambda conn: _advance(conn, cycle, cfg, _now(), None))
-        # Interrupt delivery waits for a valid slot after any unanswered user
-        # message, then starts the agent's turn.
-        pending = list(getattr(ctx.state, "pending_interrupts", None) or [])
-        pending.append(STUDY_START_MESSAGE + step)
-        ctx.state.pending_interrupts = pending
-        events = (InterruptQueued(source="learning"), RenderRequested(), BeforeLLM())
-    # Messages up to now, including the /study message, are not answers.
-    cycle["answered_entry"] = _latest_user_entry_index(ctx.state)
-    return CommandResult.notice("Study session on.", events=events, force_follow=True)
+        op_id = ctx.state.io.submit(req, tag="learning_study")
+    _learning_runtime(ctx.state).pending_study_ops[op_id] = message
+    return CommandResult.notice(
+        "Study session on.",
+        events=(RenderRequested(),),
+        force_follow=True,
+    )
 
 
 def _study_off(ctx: CommandContext) -> CommandResult:
-    setattr(ctx.state, STUDY_FLAG, False)
+    _learning_state(ctx.state).study_active = False
     return CommandResult.notice("Study session off.", events=(RenderRequested(),))
 
 
 # ---------------------------------------------------------------------------
-# /config settings
+# /config settings (pure Sans-I/O via in-memory _LearningConfigBox + StoreUpdate)
 # ---------------------------------------------------------------------------
 
 _SETTING_GROUPS = {
@@ -1625,32 +2102,16 @@ _SETTING_GROUPS = {
 }
 
 
-def _make_setting(option: ConfigOption) -> Setting:
+def _make_setting(option: ConfigOption, box: _LearningConfigBox) -> Setting:
     # The settings API has no float kind, so decimal options are edited as text.
     integer = isinstance(option.default, int)
-
-    def get(ctx):
-        value = load_config()[option.section][option.key]
-        return value if integer else format(value, "g")
-
-    def set_(ctx, value):
-        if not integer:
-            try:
-                value = float(str(value).strip())
-            except ValueError:
-                raise SettingError(f"{option.label} must be a number") from None
-        try:
-            value = coerce_option(option, value)
-        except ValueError as exc:
-            raise SettingError(f"{option.label} {exc}") from None
-        write_config_value(option, value)
 
     return Setting(
         key=f"learning.{option.section}.{option.key}",
         label=option.label,
         kind="int" if integer else "text",
-        get=get,
-        set=set_,
+        get=lambda ctx, _box=box, _opt=option: _box.get_value(_opt),
+        set=lambda ctx, value, _box=box, _opt=option: _box.set_value(_opt, value, ctx),
         group=_SETTING_GROUPS[option.section],
         help=f"{option.help} Default: {option.default:g}.",
         min=option.minimum if integer else None,
@@ -1659,14 +2120,18 @@ def _make_setting(option: ConfigOption) -> Setting:
 
 
 def register_features(builder, *, session, config):
+    del session, config
+    box = _load_config_box()
     builder.add(Feature(
         name="learning_observations",
         components=[characterize_user_understanding],
     ))
     builder.add(Feature(
         name="learning_study",
-        components=[*STUDY_TOOLS, StudyPromptInstructions()],
-        order=[StudyPromptInstructions, ExcludeForgotten, MessageRenderer],
+        components=[*STUDY_TOOLS, StudyPromptInstructions(), LearningStudyHandler()],
+        order=[IoFence, LearningStudyHandler, StudyPromptInstructions, ExcludeForgotten, MessageRenderer],
+        drivers=[LearningDriver],
+        durable_state=LEARNING_DURABLE_SPEC,
     ))
     builder.add(Feature(
         name="learning_commands",
@@ -1675,17 +2140,17 @@ def register_features(builder, *, session, config):
                 "/study", "Turn this session into a study session", _study_on,
                 args=(Arg("message", kind="text", default=""),),
                 usage="/study [what you'd like to study]",
-                init={STUDY_FLAG: bool}, section="Learning",
+                section="Learning",
             ),
             Command(
                 "/study off", "End the study session", _study_off,
-                init={STUDY_FLAG: bool}, section="Learning",
+                section="Learning",
             ),
         ],
         order=[Command],
     ))
     builder.add(Feature(
         name="learning_settings",
-        components=[_make_setting(option) for option in CONFIG_OPTIONS],
+        components=[_make_setting(option, box) for option in CONFIG_OPTIONS],
         order=[Setting],
     ))

@@ -52,7 +52,12 @@ from agent_utils.features.core import (
     RenderTransformRegistrar,
 )
 from agent_utils.features.interrupts import InterruptQueued
-from agent_zoo.durability import PluginStorage, QueuedWorkerDriver, StoreUpdate, session_context
+from agent_zoo.durability import (
+    PluginConfigBox,
+    PluginStorage,
+    QueuedWorkerDriver,
+    session_context,
+)
 from agent_zoo.events import BeforeLLM, EmitNotice
 from agent_zoo.features.commands import Arg, Command, CommandContext, CommandResult
 from agent_zoo.features.settings import Setting, SettingError
@@ -233,100 +238,61 @@ def load_config() -> dict[str, Any]:
     return _overlay_config_dict(raw, source_label=str(path))
 
 
-class _LearningConfigBox:
-    """Pure in-memory container for learning settings loaded once at feature build time."""
+def _load_config_box() -> PluginConfigBox:
+    """Build-time YAML loader returning a ``PluginConfigBox`` for ``/config``."""
+    box = PluginConfigBox(
+        _PLUGIN_NAME,
+        config_filename=_CONFIG_REL_PATH,
+    )
+    if box.load_error is not None:
+        box.load_error = f"{box.path} is not a valid YAML mapping; fix it before editing here"
+    return box
 
-    def __init__(
-        self,
-        raw_document: dict[str, Any],
-        values: dict[str, Any],
-        *,
-        load_error: str | None = None,
-    ) -> None:
-        self.raw_document: dict[str, Any] = copy.deepcopy(raw_document)
-        self.values: dict[str, Any] = copy.deepcopy(values)
-        self.load_error: str | None = load_error
 
-    def get_value(self, option: ConfigOption) -> int | str:
-        val = self.values[option.section][option.key]
-        return int(val) if isinstance(option.default, int) else format(val, "g")
-
-    def set_value(self, option: ConfigOption, raw_value: Any, ctx: Any) -> None:
-        integer = isinstance(option.default, int)
-        candidate = raw_value
-        if not integer:
-            try:
-                candidate = float(str(raw_value).strip())
-            except ValueError:
-                raise SettingError(f"{option.label} must be a number") from None
+def _get_setting_value(box: PluginConfigBox, option: ConfigOption) -> int | str:
+    raw_section = box.data.get(option.section)
+    val: int | float = option.default
+    if isinstance(raw_section, dict) and option.key in raw_section:
         try:
-            coerced = coerce_option(option, candidate)
-        except ValueError as exc:
-            raise SettingError(f"{option.label} {exc}") from None
-        if self.load_error is not None:
-            raise SettingError(self.load_error)
+            val = coerce_option(option, raw_section[option.key])
+        except ValueError:
+            val = option.default
+    return int(val) if isinstance(option.default, int) else format(val, "g")
 
-        prev_raw = copy.deepcopy(self.raw_document)
-        prev_values = copy.deepcopy(self.values)
 
-        section_map = self.raw_document.get(option.section)
+def _set_setting_value(
+    box: PluginConfigBox,
+    option: ConfigOption,
+    raw_value: Any,
+    ctx: Any,
+) -> None:
+    integer = isinstance(option.default, int)
+    candidate = raw_value
+    if not integer:
+        try:
+            candidate = float(str(raw_value).strip())
+        except ValueError:
+            raise SettingError(f"{option.label} must be a number") from None
+    try:
+        coerced = coerce_option(option, candidate)
+    except ValueError as exc:
+        raise SettingError(f"{option.label} {exc}") from None
+
+    def _updater(doc: dict[str, Any]) -> dict[str, Any]:
+        section_map = doc.get(option.section)
         if section_map is None:
             section_map = {}
-            self.raw_document[option.section] = section_map
         elif not isinstance(section_map, dict):
             raise SettingError(
                 f"{option.section} is not a valid YAML mapping; fix it before editing here"
             )
+        else:
+            section_map = dict(section_map)
         section_map[option.key] = coerced
-        self.values[option.section][option.key] = coerced
-        updated_doc = copy.deepcopy(self.raw_document)
+        doc[option.section] = section_map
+        return doc
 
-        def _rollback() -> None:
-            self.raw_document = prev_raw
-            self.values = prev_values
-
-        if ctx is not None and callable(getattr(ctx, "submit_persist_io", None)):
-            ctx.submit_persist_io(
-                StoreUpdate(
-                    plugin=_PLUGIN_NAME,
-                    scope="config",
-                    config_filename=_CONFIG_REL_PATH,
-                    value=updated_doc,
-                ),
-                rollback=_rollback,
-            )
-
-
-def _load_config_box() -> _LearningConfigBox:
-    """Build-time YAML loader populating an in-memory ``_LearningConfigBox``."""
-    path = config_path()
-    try:
-        raw_text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return _LearningConfigBox({}, _overlay_config_dict({}))
-    except (OSError, UnicodeError):
-        return _LearningConfigBox(
-            {},
-            _overlay_config_dict({}),
-            load_error=f"Cannot read {path}",
-        )
-    try:
-        parsed = yaml.safe_load(raw_text)
-    except yaml.YAMLError:
-        return _LearningConfigBox(
-            {},
-            _overlay_config_dict({}),
-            load_error=f"{path} is not a valid YAML mapping; fix it before editing here",
-        )
-    if parsed is None:
-        parsed = {}
-    if not isinstance(parsed, dict):
-        return _LearningConfigBox(
-            {},
-            _overlay_config_dict({}),
-            load_error=f"{path} is not a valid YAML mapping; fix it before editing here",
-        )
-    return _LearningConfigBox(parsed, _overlay_config_dict(parsed, source_label=str(path)))
+    box.mutate(ctx, _updater, require_persist=False)
 
 
 # ---------------------------------------------------------------------------
@@ -405,17 +371,18 @@ def _migrate(conn: sqlite3.Connection) -> None:
     )
 
 
-def connect(path: Path | None = None) -> sqlite3.Connection:
+def connect(path: Path | None = None, *, initialize: bool = True) -> sqlite3.Connection:
     path = db_path() if path is None else path
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=5.0)
     conn.row_factory = sqlite3.Row
-    # Many concurrent agent sessions write to the same database.
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(_SCHEMA)
-    _migrate(conn)
+    if initialize:
+        # Many concurrent agent sessions write to the same database.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.executescript(_SCHEMA)
+        _migrate(conn)
     return conn
 
 
@@ -435,15 +402,6 @@ def _parse_time(value: str) -> datetime | None:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     return moment
-
-
-def _run(work):
-    conn = connect()
-    try:
-        with conn:
-            return work(conn)
-    finally:
-        conn.close()
 
 
 _PENDING_OBSERVATIONS = (
@@ -803,9 +761,36 @@ class LearningDriver(QueuedWorkerDriver):
     def __init__(self, *, db_file: Path | None = None) -> None:
         super().__init__()
         self._db_file = db_file
+        self._initialized_db_paths: set[str] = set()
+        self._initialized_db_stat: dict[str, tuple[int, int]] = {}
+
+    def _open_db(self) -> sqlite3.Connection:
+        path = db_path() if self._db_file is None else self._db_file
+        path_key = str(path.resolve())
+        needs_init = True
+        if path_key in self._initialized_db_paths:
+            try:
+                st = path.stat()
+                if st.st_size > 0 and self._initialized_db_stat.get(path_key) == (st.st_dev, st.st_ino):
+                    needs_init = False
+                else:
+                    self._initialized_db_paths.discard(path_key)
+                    self._initialized_db_stat.pop(path_key, None)
+            except OSError:
+                self._initialized_db_paths.discard(path_key)
+                self._initialized_db_stat.pop(path_key, None)
+        conn = connect(path, initialize=needs_init)
+        if needs_init:
+            try:
+                st = path.stat()
+                self._initialized_db_paths.add(path_key)
+                self._initialized_db_stat[path_key] = (st.st_dev, st.st_ino)
+            except OSError:
+                pass
+        return conn
 
     def _run_db(self, work):
-        conn = connect(self._db_file)
+        conn = self._open_db()
         try:
             with conn:
                 return work(conn)
@@ -1397,10 +1382,6 @@ dismiss_observation = DismissObservation()
 # graph.
 # ---------------------------------------------------------------------------
 
-def _cycle(state) -> dict:
-    return _learning_state(state).cycle
-
-
 def _new_cycle(cycle: dict) -> None:
     cycle.update(
         phase="", node_id=None,
@@ -1956,7 +1937,7 @@ def _study_off(ctx: CommandContext) -> CommandResult:
 
 
 # ---------------------------------------------------------------------------
-# /config settings (pure Sans-I/O via in-memory _LearningConfigBox + StoreUpdate)
+# /config settings (pure Sans-I/O via PluginConfigBox)
 # ---------------------------------------------------------------------------
 
 _SETTING_GROUPS = {
@@ -1967,7 +1948,7 @@ _SETTING_GROUPS = {
 }
 
 
-def _make_setting(option: ConfigOption, box: _LearningConfigBox) -> Setting:
+def _make_setting(option: ConfigOption, box: PluginConfigBox) -> Setting:
     # The settings API has no float kind, so decimal options are edited as text.
     integer = isinstance(option.default, int)
 
@@ -1975,8 +1956,8 @@ def _make_setting(option: ConfigOption, box: _LearningConfigBox) -> Setting:
         key=f"learning.{option.section}.{option.key}",
         label=option.label,
         kind="int" if integer else "text",
-        get=lambda ctx, _box=box, _opt=option: _box.get_value(_opt),
-        set=lambda ctx, value, _box=box, _opt=option: _box.set_value(_opt, value, ctx),
+        get=lambda ctx, _box=box, _opt=option: _get_setting_value(_box, _opt),
+        set=lambda ctx, value, _box=box, _opt=option: _set_setting_value(_box, _opt, value, ctx),
         group=_SETTING_GROUPS[option.section],
         help=f"{option.help} Default: {option.default:g}.",
         min=option.minimum if integer else None,

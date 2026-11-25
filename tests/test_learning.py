@@ -953,3 +953,55 @@ def test_config_changes_cycle_lengths(tmp_path):
     state, _ = _start()
 
     assert "Step: teach" in _answer(state, node, True)
+
+
+def test_learning_driver_caches_db_init_and_reinitializes_after_delete(tmp_path, monkeypatch):
+    db_file = tmp_path / "cached.sqlite"
+    driver = plugin.LearningDriver(db_file=db_file)
+    migrate_calls = 0
+    real_migrate = plugin._migrate
+
+    def counting_migrate(conn):
+        nonlocal migrate_calls
+        migrate_calls += 1
+        return real_migrate(conn)
+
+    monkeypatch.setattr(plugin, "_migrate", counting_migrate)
+    try:
+        assert driver.execute_request(
+            plugin.AddKnowledgeOp(statement="First node", timestamp="2026-11-01T00:00:00+00:00")
+        ) == "Added node 1."
+        assert migrate_calls == 1
+        assert str(db_file.resolve()) in driver._initialized_db_paths
+
+        # Subsequent reads/writes reuse the initialized DB path without re-running DDL/migration.
+        assert "First node" in driver.execute_request(plugin.SearchKnowledgeOp(query="First"))
+        assert driver.execute_request(
+            plugin.AddKnowledgeOp(statement="Second node", timestamp="2026-11-01T00:00:01+00:00")
+        ) == "Added node 2."
+        assert migrate_calls == 1
+
+        # Deleting and recreating the DB file triggers re-initialization cleanly.
+        db_file.unlink()
+        for suffix in ("-wal", "-shm"):
+            side = Path(str(db_file) + suffix)
+            if side.exists():
+                side.unlink()
+        assert driver.execute_request(
+            plugin.AddKnowledgeOp(statement="Reborn node", timestamp="2026-11-01T00:00:02+00:00")
+        ) == "Added node 1."
+        assert migrate_calls == 2
+    finally:
+        driver.close()
+
+
+def test_settings_preserve_concurrent_sibling_key_edits_on_disk(tmp_path):
+    _write_config(tmp_path, "cycle:\n  probe_questions: 3\n")
+    _, set_ = _settings_harness()
+    # Another process edits a sibling key on disk after our PluginConfigBox loaded.
+    _write_config(tmp_path, "cycle:\n  probe_questions: 3\n  candidates: 9\n")
+
+    assert set_("learning.cycle.probe_questions", 5)["ok"]
+    persisted = yaml.safe_load(plugin.config_path().read_text(encoding="utf-8"))
+    assert persisted["cycle"]["probe_questions"] == 5
+    assert persisted["cycle"]["candidates"] == 9

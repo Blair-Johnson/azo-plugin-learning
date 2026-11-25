@@ -52,12 +52,10 @@ from agent_utils.features.core import (
     RenderTransformRegistrar,
 )
 from agent_utils.features.interrupts import InterruptQueued
-from agent_zoo.core.feature_state import session_state
-from agent_zoo.durability import PluginStorage, QueuedWorkerDriver, StoreUpdate
+from agent_zoo.durability import PluginStorage, QueuedWorkerDriver, StoreUpdate, session_context
 from agent_zoo.events import BeforeLLM, EmitNotice
 from agent_zoo.features.commands import Arg, Command, CommandContext, CommandResult
 from agent_zoo.features.settings import Setting, SettingError
-from agent_zoo.storage.projects import resolve_state_root
 
 log = logging.getLogger("agent_zoo_user_plugin.learning")
 
@@ -389,7 +387,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS evidence_observation_node
 
 
 def db_path() -> Path:
-    return resolve_state_root() / "learning" / "learning.sqlite"
+    return PluginStorage(_PLUGIN_NAME).state_root / "learning" / "learning.sqlite"
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -519,27 +517,13 @@ def _learning_runtime(state: Any) -> LearningRuntime:
 def _current_session_id(state: Any) -> str:
     if state is None:
         return ""
-    smeta = session_state(state)
-    sid = str(smeta.session_id or "").strip()
-    if sid:
-        return sid
-    context = getattr(state, "_agent_zoo_context", None)
-    if isinstance(context, dict):
-        return str(context.get("session_id") or "").strip()
-    return ""
+    return str(session_context(state).session_id or "").strip()
 
 
 def _current_project(state: Any) -> str:
     if state is None:
         return ""
-    smeta = session_state(state)
-    proj = str(smeta.project_name or "").strip()
-    if proj:
-        return proj
-    context = getattr(state, "_agent_zoo_context", None)
-    if isinstance(context, dict):
-        return str(context.get("project_name") or "").strip()
-    return ""
+    return str(session_context(state).project_name or "").strip()
 
 
 def _latest_user_entry_index(state: Any) -> int | None:
@@ -1078,7 +1062,6 @@ class LearningDriver(QueuedWorkerDriver):
 
 _STATE_READS = {
     "entries",
-    "_agent_zoo_context",
 }
 
 
@@ -2001,8 +1984,8 @@ def _make_setting(option: ConfigOption, box: _LearningConfigBox) -> Setting:
     )
 
 
-def register_features(builder, *, session, config):
-    del session, config
+def register_features(builder, *, config):
+    del config
     box = _load_config_box()
     builder.add(Feature(
         name="learning_observations",

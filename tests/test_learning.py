@@ -92,7 +92,7 @@ def _build_session(*, with_interrupts=False, with_commands=False, with_settings=
         builder.add(commands_feature())
     if with_settings:
         builder.add(settings_feature())
-    plugin.register_features(builder, session=session, config={})
+    plugin.register_features(builder, config={})
     session.pipeline = builder.build()
     session.ensure_initialized()
     return session, builder
@@ -233,7 +233,7 @@ def test_composes_onto_default_agent_zoo_builder():
     builder = build_default_builder(
         session, config={}, include_plugins=False, include_llm_drivers=False
     )
-    plugin.register_features(builder, session=session, config={})
+    plugin.register_features(builder, config={})
     session.pipeline = builder.build()
     session.ensure_initialized()
     assert_pipeline_sans_io(session.pipeline)
